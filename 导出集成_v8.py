@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-导出并拆表 v2.1（UE 5.7 兼容）
+导出并拆表 v2.2（UE 5.7 兼容）
 流程：
   1. 导出 UE 所有 DataTable → DataTables_Export
   2. 镜像备份              → DataTables_Export_留档
@@ -54,6 +54,9 @@ STRUCT_SPLIT_FIELDS = {
     ("InGameScoreGroupDefineT", "ScoreColor"),
     ("InGameScoreActionDefineT", "Rule"),
 }
+# 只允许这些表在原始 CSV 尚未经过 Excel 单元格时直接拆分。
+# 用精确表名控制范围，避免改变其他表的导出链路。
+DIRECT_CSV_SPLIT_TABLES = {"DifficultyDefineT"}
 
 # ── 样式配置 ──────────────────────────────────────────
 STYLE_ROW1 = ("2F5496", "FFFFFF")  # 深蓝底 白字
@@ -221,48 +224,58 @@ def run_export(table_list):
                 csv_headers = all_csv_rows[0]   # 第一行：列名
                 csv_data    = all_csv_rows[1:]   # 其余：数据行
 
-                wb = openpyxl.Workbook()
-                ws = wb.active
-                ws.title = asset_name[:31]
-
-                # 从 UE RowStruct 读取真实容器类型，写入隐藏元数据表。
+                # 从 UE RowStruct 读取真实容器类型。
                 field_types = get_row_struct_field_types(data_table, csv_headers[1:])
-                ws_meta = wb.create_sheet(TYPE_SHEET_NAME)
-                ws_meta.append(["FieldName", "FieldType"])
-                for col_name in csv_headers[1:]:
-                    ws_meta.append([col_name, field_types.get(str(col_name), None)])
-                ws_meta.sheet_state = "hidden"
-
-                header_fill = PatternFill("solid", fgColor="2F5496")
-                header_font = Font(color="FFFFFF", bold=True)
-
-                # 写三行表头（第一列是 RowName，对应旧版的 "---"）
-                ws.cell(row=1, column=1, value="---").fill = header_fill
-                ws.cell(row=1, column=1).font = header_font
-                for col_idx, col_name in enumerate(csv_headers[1:], start=2):
-                    cell = ws.cell(row=1, column=col_idx, value=col_name)
-                    cell.fill = header_fill
-                    cell.font = header_font
-
-                # 第二行保留为拆分子字段表头；第三行固定保存字段类型。
-                ws.cell(row=3, column=1, value="#FieldType")
-                for col_idx, col_name in enumerate(csv_headers[1:], start=2):
-                    ws.cell(row=3, column=col_idx,
-                            value=field_types.get(str(col_name), None))
-                style_header_row(ws, 2, *STYLE_ROW2)
-                style_header_row(ws, 3, *STYLE_ROW3)
-
-                # 写数据（UE CSV 第一列是 RowName，其余原样写入）
-                for row_idx, row in enumerate(csv_data, start=4):
-                    for col_idx, val in enumerate(row, start=1):
-                        ws.cell(row=row_idx, column=col_idx, value=val if val else None)
-
-                for col in ws.columns:
-                    max_len = max((len(str(c.value or "")) for c in col), default=0)
-                    ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
-
                 xlsx_path = os.path.join(output_dir, f"{asset_name}.xlsx")
-                wb.save(xlsx_path)
+                if asset_name in DIRECT_CSV_SPLIT_TABLES:
+                    # DifficultyDefineT 的超长数组直接从完整 CSV 内存拆列，
+                    # 避开 Excel 单元格 32767 字符上限。
+                    msg = process_csv_rows_directly(
+                        asset_name, csv_headers, csv_data, field_types, xlsx_path
+                    )
+                    unreal.log(f"定向直拆: {relative} - {msg}")
+                else:
+                    # 其他表完全保留 v7 的普通导出流程。
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = asset_name[:31]
+
+                    # 写入隐藏元数据表。
+                    ws_meta = wb.create_sheet(TYPE_SHEET_NAME)
+                    ws_meta.append(["FieldName", "FieldType"])
+                    for col_name in csv_headers[1:]:
+                        ws_meta.append([col_name, field_types.get(str(col_name), None)])
+                    ws_meta.sheet_state = "hidden"
+
+                    header_fill = PatternFill("solid", fgColor="2F5496")
+                    header_font = Font(color="FFFFFF", bold=True)
+
+                    # 写三行表头（第一列是 RowName，对应旧版的 "---"）
+                    ws.cell(row=1, column=1, value="---").fill = header_fill
+                    ws.cell(row=1, column=1).font = header_font
+                    for col_idx, col_name in enumerate(csv_headers[1:], start=2):
+                        cell = ws.cell(row=1, column=col_idx, value=col_name)
+                        cell.fill = header_fill
+                        cell.font = header_font
+
+                    # 第二行保留为拆分子字段表头；第三行固定保存字段类型。
+                    ws.cell(row=3, column=1, value="#FieldType")
+                    for col_idx, col_name in enumerate(csv_headers[1:], start=2):
+                        ws.cell(row=3, column=col_idx,
+                                value=field_types.get(str(col_name), None))
+                    style_header_row(ws, 2, *STYLE_ROW2)
+                    style_header_row(ws, 3, *STYLE_ROW3)
+
+                    # 写数据（UE CSV 第一列是 RowName，其余原样写入）
+                    for row_idx, row in enumerate(csv_data, start=4):
+                        for col_idx, val in enumerate(row, start=1):
+                            ws.cell(row=row_idx, column=col_idx, value=val if val else None)
+
+                    for col in ws.columns:
+                        max_len = max((len(str(c.value or "")) for c in col), default=0)
+                        ws.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+                    wb.save(xlsx_path)
 
                 success_count += 1
                 exported_list.append(relative)
@@ -964,6 +977,57 @@ def process_xlsx(input_path, output_path):
     )
 
 
+def process_csv_rows_directly(asset_name, csv_headers, csv_data, field_types, output_path):
+    """
+    只供 DIRECT_CSV_SPLIT_TABLES 使用：
+    在 UE 原始 CSV 数据仍完整时直接拆列并写入 XLSX，
+    避免先写入单个超长 Excel 单元格造成截断。
+    """
+    headers = ["---"] + list(csv_headers[1:])
+    data_rows = []
+    for csv_row in csv_data:
+        row = list(csv_row)
+        if len(row) < len(headers):
+            row.extend([None] * (len(headers) - len(row)))
+        data_rows.append(row[:len(headers)])
+
+    array_cols = analyze_array_columns(headers, data_rows)
+    struct_cols = analyze_selected_struct_columns(asset_name, headers, data_rows)
+    row1, row2, col_plan = build_column_plan(headers, array_cols, struct_cols)
+
+    row3 = []
+    for item in col_plan:
+        ptype, ci = item[0], item[1]
+        field = str(headers[ci]) if ci < len(headers) and headers[ci] is not None else ""
+        if ptype in ("struct_string", "struct_value", "struct_raw"):
+            marker = ptype.upper()
+        else:
+            marker = field_types.get(field)
+            if marker is None and ptype != "normal":
+                marker = "MAP" if array_cols.get(ci, {}).get("kind") == "tmap" else "ARRAY"
+        row3.append(marker)
+    row3[0] = "#FieldType"
+
+    wb_out = openpyxl.Workbook()
+    ws_out = wb_out.active
+    ws_out.title = asset_name[:31]
+    ws_out.append(row1)
+    ws_out.append(row2)
+    ws_out.append(row3)
+    for row in data_rows:
+        ws_out.append(expand_row(row, col_plan))
+
+    style_header_row(ws_out, 1, *STYLE_ROW1)
+    style_header_row(ws_out, 2, *STYLE_ROW2)
+    style_header_row(ws_out, 3, *STYLE_ROW3)
+    auto_col_width(ws_out)
+    apply_section_borders(ws_out, col_plan, total_rows=len(data_rows) + 3)
+    wb_out.save(output_path)
+
+    array_fields = [d["field"] for d in array_cols.values()]
+    return f"CSV内存直拆完成，数组字段: {array_fields}，总列数: {len(row1)}"
+
+
 # ══════════════════════════════════════════════════════
 # 【第四部分】拆表主流程
 # ══════════════════════════════════════════════════════
@@ -1017,7 +1081,13 @@ def run_split():
                 continue
 
             try:
-                msg = process_xlsx(input_path, output_path)
+                asset_name = os.path.basename(entry)
+                if asset_name in DIRECT_CSV_SPLIT_TABLES:
+                    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+                    shutil.copy2(input_path, output_path)
+                    msg = "已使用导出阶段的CSV内存直拆结果"
+                else:
+                    msg = process_xlsx(input_path, output_path)
                 success.append(entry)
                 unreal.log(f"✅ {entry} - {msg}")
             except Exception as e:
