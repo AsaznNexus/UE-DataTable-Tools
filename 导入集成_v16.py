@@ -1584,6 +1584,16 @@ else:
                 f"【导入】成功 {len(import_success)} 个，失败 {len(import_fail)} 个\n"
                 f"【超限跳过】{len(limit_skipped)} 个表"
             )
+            if import_success:
+                updated_table_lines = "\n".join(
+                    f"  • {entry}" for entry in import_success
+                )
+                summary += (
+                    f"\n\n【本次成功更新的表格（{len(import_success)} 个）】\n"
+                    f"{updated_table_lines}"
+                )
+            else:
+                summary += "\n\n【本次成功更新的表格】\n  无"
             if direct_import_reports:
                 summary += "\n\n【超限导回详情】\n" + "\n".join(direct_import_reports)
             all_fail = []
