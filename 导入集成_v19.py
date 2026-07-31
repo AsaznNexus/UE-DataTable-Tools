@@ -1,18 +1,21 @@
 # -*- coding: utf-8 -*-
 """
-合表并导入 v1.2
+合表并导入 v1.5（导入集成_v19）
 流程：
   1. 扫描 DataTables_Cehua 下所有表，筛选出在 UE 中有对应资产的【可导入表】
-  2. 弹出勾选界面（tkinter），让用户勾选本次要导入的表（默认预勾选 导入列表.txt 中的表）
-  3. 按勾选结果合表：DataTables_Cehua → DataTables_Export
-  4. P4 冲突检测：找出被他人签出的表
-  5. 弹窗确认：有冲突时询问是否跳过继续
+  2. 弹出勾选界面（tkinter），让用户勾选本次要导入的表，并选择本次是否使用 BCompare
+  3. P4 冲突检测：找出被他人签出的表
+  4. 可选：将导出留档临时拆成策划格式，只比较本次勾选且实际变化的表
+  5. 按确认结果合表：DataTables_Cehua → DataTables_Export
   6. 导入：DataTables_Export → UE
 
 说明：
   - 导出/拆表由 操作列表.txt 决定（拆表范围，通常较大），本脚本不依赖
   - 导入列表.txt 仅作为“默认预勾选”的参考，不再是唯一入口
   - 实际导入范围以本次勾选界面的选择为准
+  - BCompare 为可选功能；程序路径只通过手动选择，并保存到脚本目录配置文件
+  - BCompare 两侧统一使用策划拆分格式，避免数组序列化格式造成误报
+  - 兼容不同 UE Python 枚举命名；缺少 SourceControlHelpers 时自动跳过 P4 检测
 """
 
 import unreal
@@ -21,6 +24,29 @@ import re
 import sys
 import json
 import shutil
+import subprocess
+
+
+def _resolve_unreal_enum(enum_type, *candidate_names):
+    """兼容 UE Python 枚举在不同引擎版本中的命名差异。"""
+    for name in candidate_names:
+        if hasattr(enum_type, name):
+            return getattr(enum_type, name)
+    enum_name = getattr(enum_type, "__name__", str(enum_type))
+    raise RuntimeError(
+        f"当前 UE 的 {enum_name} 缺少兼容枚举：{', '.join(candidate_names)}"
+    )
+
+
+APP_MSG_YES_NO = _resolve_unreal_enum(unreal.AppMsgType, "YES_NO", "YesNo")
+APP_RETURN_YES = _resolve_unreal_enum(unreal.AppReturnType, "YES", "Yes")
+SOURCE_CONTROL_HELPERS = getattr(unreal, "SourceControlHelpers", None)
+
+
+def show_yes_no(title, message):
+    """显示是/否确认框，并统一返回布尔值。"""
+    choice = unreal.EditorDialog.show_message(title, message, APP_MSG_YES_NO)
+    return choice == APP_RETURN_YES
 
 # ── 依赖检测：openpyxl ────────────────────────────────
 try:
@@ -39,6 +65,7 @@ except ImportError:
 # ── 依赖检测：tkinter ─────────────────────────────────
 try:
     import tkinter as tk
+    from tkinter import filedialog
 except ImportError:
     unreal.log_error("未检测到 tkinter")
     unreal.EditorDialog.show_message(
@@ -53,8 +80,11 @@ except ImportError:
 BASE_DIR         = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
 CEHUA_BASE       = f"{BASE_DIR}/DataTables_Cehua/"
 EXPORT_BASE      = f"{BASE_DIR}/DataTables_Export/"
+ARCHIVE_BASE     = f"{BASE_DIR}/DataTables_Export_留档/"
 LIST_FILE        = f"{BASE_DIR}/操作列表.txt"      # 拆表范围（导出脚本用，本脚本不依赖）
 IMPORT_LIST_FILE = f"{BASE_DIR}/导入列表.txt"      # 导入范围（本脚本实际使用）
+TOOL_CONFIG_FILE = f"{BASE_DIR}/DataTable工具配置.json"
+BCOMPARE_SESSION_BASE = f"{BASE_DIR}/BCompare_本次导入/"
 UE_BASE_PATH = "/Game/GDataTables"
 EXCEL_CELL_CHAR_LIMIT = 32767
 DIRECT_IMPORT_TABLES = {"DifficultyDefineT"}
@@ -97,6 +127,86 @@ class ExcelCellLimitError(Exception):
 def is_direct_import_table(entry):
     """只对指定特例表启用拆分表直接内存导入。"""
     return os.path.basename(str(entry).replace("\\", "/")) in DIRECT_IMPORT_TABLES
+
+
+def load_tool_config():
+    """读取工具配置；配置缺失或损坏时返回空配置。"""
+    if not os.path.isfile(TOOL_CONFIG_FILE):
+        return {}
+    try:
+        with open(TOOL_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        unreal.log_warning(f"读取工具配置失败，将使用空配置：{e}")
+        return {}
+
+
+def save_bcompare_path(exe_path):
+    """保存 BCompare.exe 路径，同时保留配置文件中的其他项目。"""
+    config = load_tool_config()
+    config["bcompare_path"] = os.path.abspath(exe_path)
+    temp_path = TOOL_CONFIG_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, TOOL_CONFIG_FILE)
+        return True, ""
+    except Exception as e:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        return False, str(e)
+
+
+def get_saved_bcompare_path():
+    """返回仍然有效的已保存路径；不执行注册表、PATH 或常见目录检测。"""
+    path = load_tool_config().get("bcompare_path")
+    if not isinstance(path, str) or not path.strip():
+        return None
+    path = os.path.abspath(path.strip())
+    if os.path.isfile(path) and os.path.basename(path).lower() == "bcompare.exe":
+        return path
+    return None
+
+
+def choose_bcompare_exe(parent=None):
+    """由用户手动选择 BCompare.exe，选择成功后永久保存路径。"""
+    dialog_root = None
+    try:
+        if parent is None:
+            dialog_root = tk.Tk()
+            dialog_root.withdraw()
+            dialog_root.attributes("-topmost", True)
+            parent = dialog_root
+        path = filedialog.askopenfilename(
+            parent=parent,
+            title="请选择 BCompare.exe",
+            filetypes=[("Beyond Compare", "BCompare.exe"), ("可执行文件", "*.exe")],
+        )
+    finally:
+        if dialog_root is not None:
+            dialog_root.destroy()
+    if not path:
+        return None
+    path = os.path.abspath(path)
+    if not os.path.isfile(path) or os.path.basename(path).lower() != "bcompare.exe":
+        unreal.EditorDialog.show_message(
+            "BCompare 路径无效",
+            "请选择 Beyond Compare 安装目录中的 BCompare.exe。",
+            unreal.AppMsgType.OK
+        )
+        return None
+    saved, error = save_bcompare_path(path)
+    if not saved:
+        unreal.EditorDialog.show_message(
+            "配置保存失败",
+            f"BCompare 本次仍可使用，但程序路径未能永久保存：\n{error}",
+            unreal.AppMsgType.OK
+        )
+    return path
 
 
 # ══════════════════════════════════════════════════════
@@ -162,11 +272,11 @@ def select_tables_gui(grouped, preselected=None):
     返回用户确认勾选的 entry 列表（跨所有组）；用户取消/关闭窗口返回 None。
     """
     preselected = preselected or set()
-    result = {"selected": None}
+    result = {"selected": None, "use_bcompare": False}
 
     root = tk.Tk()
     root.title("选择要导入的表")
-    root.geometry("560x680")
+    root.geometry("600x740")
     root.attributes("-topmost", True)
 
     # ── 顶部：搜索框 + 全局全选/全不选 ──
@@ -262,12 +372,54 @@ def select_tables_gui(grouped, preselected=None):
     tk.Button(top, text="全选",   command=select_all).pack(side="left", padx=2)
     tk.Button(top, text="全不选", command=select_none).pack(side="left", padx=2)
 
+    # ── BCompare：本次可选，路径只允许用户手动指定 ──
+    compare_frame = tk.LabelFrame(root, text="导回前比较")
+    compare_frame.pack(fill="x", padx=10, pady=(4, 0))
+
+    saved_bcompare = get_saved_bcompare_path()
+    use_bcompare_var = tk.BooleanVar(value=bool(saved_bcompare))
+    bcompare_path_var = tk.StringVar(
+        value=saved_bcompare or "尚未选择 BCompare.exe（本次可取消勾选直接导回）"
+    )
+
+    tk.Checkbutton(
+        compare_frame,
+        text="本次使用 BCompare（仅显示本次勾选且实际变化的表）",
+        variable=use_bcompare_var,
+        anchor="w",
+        justify="left",
+    ).pack(fill="x", padx=8, pady=(5, 2))
+
+    path_row = tk.Frame(compare_frame)
+    path_row.pack(fill="x", padx=8, pady=(0, 6))
+    tk.Label(
+        path_row,
+        textvariable=bcompare_path_var,
+        anchor="w",
+        justify="left",
+        wraplength=430,
+        fg="#555555",
+    ).pack(side="left", fill="x", expand=True)
+
+    def reselect_bcompare():
+        path = choose_bcompare_exe(root)
+        if path:
+            bcompare_path_var.set(path)
+            use_bcompare_var.set(True)
+
+    tk.Button(
+        path_row,
+        text="选择/更换程序",
+        command=reselect_bcompare,
+    ).pack(side="right", padx=(8, 0))
+
     # ── 底部：确定 / 取消 ──
     bottom = tk.Frame(root)
     bottom.pack(fill="x", padx=10, pady=10)
 
     def on_confirm():
         result["selected"] = [e for e, v in vars_by_entry.items() if v.get()]
+        result["use_bcompare"] = bool(use_bcompare_var.get())
         root.destroy()
 
     def on_cancel():
@@ -282,7 +434,7 @@ def select_tables_gui(grouped, preselected=None):
     update_count()
     root.mainloop()
 
-    return result["selected"]
+    return result["selected"], result["use_bcompare"]
 
 
 def load_table_list():
@@ -293,17 +445,17 @@ def load_table_list():
                f"（需要同时满足：存在 xlsx 文件 且 UE 中已有对应 DataTable 资产）：\n{CEHUA_BASE}")
         unreal.log_warning(msg)
         unreal.EditorDialog.show_message("无可导入的表", msg, unreal.AppMsgType.OK)
-        return []
+        return [], False
 
     preselected = load_default_selection(IMPORT_LIST_FILE)
-    selected = select_tables_gui(grouped, preselected)
+    selected, use_bcompare = select_tables_gui(grouped, preselected)
 
     if selected is None:
         unreal.log_warning("用户取消了表选择")
-        return []
+        return [], False
     if not selected:
         unreal.log_warning("未勾选任何表")
-    return selected
+    return selected, use_bcompare
 
 
 # ══════════════════════════════════════════════════════
@@ -964,7 +1116,13 @@ def build_direct_import_rows(input_path):
 def check_p4_conflicts(table_list):
     can_import = []
     conflicts  = []
-    source_control = unreal.SourceControlHelpers
+    source_control = SOURCE_CONTROL_HELPERS
+
+    if source_control is None:
+        unreal.log_warning(
+            "当前 UE 未提供 SourceControlHelpers，已跳过 P4 冲突检测"
+        )
+        return list(table_list), conflicts
 
     for entry in table_list:
         ue_asset_path = f"{UE_BASE_PATH}/{entry}"
@@ -1323,10 +1481,11 @@ def import_table(entry):
         )
 
         if result:
-            try:
-                unreal.SourceControlHelpers.check_out_file(ue_asset_path)
-            except Exception:
-                pass
+            if SOURCE_CONTROL_HELPERS is not None:
+                try:
+                    SOURCE_CONTROL_HELPERS.check_out_file(ue_asset_path)
+                except Exception:
+                    pass
             save_ok = unreal.EditorAssetLibrary.save_asset(ue_asset_path)
             if save_ok:
                 return True, f"{len(rows)} 行"
@@ -1359,10 +1518,11 @@ def import_direct_table(entry):
         )
 
         if result:
-            try:
-                unreal.SourceControlHelpers.check_out_file(ue_asset_path)
-            except Exception:
-                pass
+            if SOURCE_CONTROL_HELPERS is not None:
+                try:
+                    SOURCE_CONTROL_HELPERS.check_out_file(ue_asset_path)
+                except Exception:
+                    pass
             save_ok = unreal.EditorAssetLibrary.save_asset(ue_asset_path)
             if save_ok:
                 max_chars = direct_stats["max_cell_chars"]
@@ -1406,6 +1566,387 @@ def format_limit_skips(limit_skipped, max_items=10):
     return "\n".join(lines), total_cells
 
 
+def _xlsx_active_values(path):
+    """读取活动工作表的有效单元格值，用于排除 xlsx 压缩包时间戳和样式差异。"""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    try:
+        ws = wb.active
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            values = list(row)
+            while values and values[-1] is None:
+                values.pop()
+            rows.append(tuple(values))
+        while rows and not rows[-1]:
+            rows.pop()
+        return tuple(rows)
+    finally:
+        wb.close()
+
+
+def _xlsx_content_equal(before_path, after_path):
+    """按工作表内容判断两份 xlsx 是否相同。"""
+    return _xlsx_active_values(before_path) == _xlsx_active_values(after_path)
+
+
+def _compare_unquote(value):
+    """移除比较用结构体值最外层引号，保持导出拆表后的单元格表现。"""
+    text = str(value).strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    return text
+
+
+def _compare_struct_dict(value):
+    """将单个 UE 结构体解析为比较用字典，保留值的文本形式。"""
+    if value is None:
+        return {}
+    text = str(value).strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        return {}
+    result = {}
+    for token in _split_single_struct_assignments(text[1:-1]):
+        if "=" not in token:
+            continue
+        key, _, raw_value = token.partition("=")
+        key = key.strip()
+        if key:
+            result[key] = _compare_unquote(raw_value)
+    return result
+
+
+def _compare_kv_pair(value):
+    """解析 UE 旧式 TMap 元素 (Key,Value)，值保持文本形式。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        return None
+    inner = text[1:-1]
+    if "=" in inner:
+        return None
+    parts = _split_scalar_items(inner)
+    if len(parts) != 2:
+        return None
+    return {
+        "Key": _compare_unquote(parts[0]),
+        "Value": _compare_unquote(parts[1]),
+    }
+
+
+def _compare_array_items(value):
+    """
+    将 UE/JSON 数组解析为比较元素列表。
+    只用于生成临时拆分留档，不参与合表或 UE 导入。
+    """
+    if value is None:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    if not (text.startswith("(") and text.endswith(")")):
+        return []
+
+    inner = text[1:-1].strip()
+    if not inner:
+        return []
+    if inner.startswith("("):
+        return _split_ue_array_items(inner)
+    if _is_single_ue_struct(inner):
+        return [text]
+    return [_compare_unquote(item) for item in _split_scalar_items(inner)]
+
+
+def _compare_array_item_value(items, plan_item):
+    """按策划表列计划，从数组元素中取出对应拆列值。"""
+    kind = plan_item[0]
+    arr_idx = plan_item[3]
+    if arr_idx >= len(items):
+        return None
+    item = items[arr_idx]
+
+    if kind in ("tset_item", "array_scalar"):
+        if isinstance(item, str):
+            text = item.strip()
+            if text.startswith("(") and text.endswith(")") and "=" not in text:
+                return _compare_unquote(text[1:-1])
+        return item
+
+    if isinstance(item, dict):
+        item_dict = item
+    else:
+        item_dict = _compare_kv_pair(item) or _compare_struct_dict(item)
+
+    if kind == "tmap_key":
+        key_name = next((key for key in item_dict if key.lower() == "key"), None)
+        return item_dict.get(key_name) if key_name else None
+    if kind == "tmap_val":
+        value_name = next((key for key in item_dict if key.lower() == "value"), None)
+        return item_dict.get(value_name) if value_name else None
+    if kind == "array_struct":
+        return item_dict.get(plan_item[4])
+    return None
+
+
+def _build_split_archive_for_compare(entry, archive_path, cehua_path, output_path):
+    """
+    根据当前策划表的三行表头，将 UE 原始留档临时展开成同结构拆分表。
+    DifficultyDefineT 的留档已在导出 v8 的 CSV 内存阶段直拆，直接复制。
+    """
+    if is_direct_import_table(entry):
+        shutil.copy2(archive_path, output_path)
+        return
+
+    before_wb = openpyxl.load_workbook(archive_path, read_only=True, data_only=False)
+    after_wb = openpyxl.load_workbook(cehua_path, read_only=True, data_only=False)
+    try:
+        before_rows = list(before_wb.active.iter_rows(values_only=True))
+        after_header_rows = list(
+            after_wb.active.iter_rows(min_row=1, max_row=3, values_only=True)
+        )
+    finally:
+        before_wb.close()
+        after_wb.close()
+
+    if len(after_header_rows) < 3:
+        raise ValueError("当前策划表缺少完整的三行表头")
+    row1 = list(after_header_rows[0])
+    row2 = list(after_header_rows[1])
+    row3 = list(after_header_rows[2])
+    if not row3 or str(row3[0]).strip() != "#FieldType":
+        raise ValueError("当前策划表第三行缺少 #FieldType")
+    if not before_rows:
+        raise ValueError("导出留档为空")
+
+    asset_name = os.path.basename(str(entry).replace("\\", "/"))
+    plan = analyze_cehua_headers(row1, row2, row3, asset_name)
+    archive_headers = list(before_rows[0])
+    archive_indices = {}
+    for ci, field in enumerate(archive_headers):
+        field_name = str(field).strip() if field is not None else ""
+        if field_name and field_name not in archive_indices:
+            archive_indices[field_name] = ci
+
+    archive_has_type_row = (
+        len(before_rows) >= 3
+        and before_rows[2]
+        and str(before_rows[2][0]).strip() == "#FieldType"
+    )
+    archive_data_rows = before_rows[3:] if archive_has_type_row else before_rows[1:]
+
+    output_wb = openpyxl.Workbook()
+    output_ws = output_wb.active
+    output_ws.title = asset_name[:31]
+    output_ws.append(row1)
+    output_ws.append(row2)
+    output_ws.append(row3)
+
+    for archive_row in archive_data_rows:
+        array_cache = {}
+        struct_cache = {}
+        expanded_row = []
+        for item in plan:
+            kind = item[0]
+            field = item[2]
+            source_ci = archive_indices.get(str(field).strip())
+            raw_value = (
+                archive_row[source_ci]
+                if source_ci is not None and source_ci < len(archive_row)
+                else None
+            )
+
+            if kind == "normal":
+                expanded_row.append(raw_value)
+            elif kind in ("struct_string", "struct_value", "struct_raw"):
+                if field not in struct_cache:
+                    struct_cache[field] = _compare_struct_dict(raw_value)
+                expanded_row.append(struct_cache[field].get(item[3]))
+            else:
+                if field not in array_cache:
+                    array_cache[field] = _compare_array_items(raw_value)
+                expanded_row.append(
+                    _compare_array_item_value(array_cache[field], item)
+                )
+        output_ws.append(expanded_row)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_wb.save(output_path)
+
+
+def prepare_bcompare_session(entries):
+    """
+    将留档临时拆成策划格式，创建只包含本次实际变化表的比较目录。
+    返回 (changed_entries, warning_lines, before_dir, after_dir)。
+    """
+    before_dir = os.path.join(BCOMPARE_SESSION_BASE, "修改前").replace("\\", "/")
+    after_dir = os.path.join(BCOMPARE_SESSION_BASE, "修改后").replace("\\", "/")
+
+    if os.path.isdir(BCOMPARE_SESSION_BASE):
+        shutil.rmtree(BCOMPARE_SESSION_BASE)
+    os.makedirs(before_dir, exist_ok=True)
+    os.makedirs(after_dir, exist_ok=True)
+
+    changed_entries = []
+    warning_lines = []
+
+    for entry in entries:
+        archive_path = os.path.join(ARCHIVE_BASE, entry + ".xlsx").replace("\\", "/")
+        after_path = os.path.join(CEHUA_BASE, entry + ".xlsx").replace("\\", "/")
+        before_exists = os.path.isfile(archive_path)
+        after_exists = os.path.isfile(after_path)
+
+        if not after_exists:
+            warning_lines.append(f"{entry}：找不到当前策划拆分表")
+            continue
+
+        relative_path = entry + ".xlsx"
+        before_copy = os.path.join(before_dir, relative_path)
+        after_copy = os.path.join(after_dir, relative_path)
+        os.makedirs(os.path.dirname(before_copy), exist_ok=True)
+        os.makedirs(os.path.dirname(after_copy), exist_ok=True)
+        shutil.copy2(after_path, after_copy)
+
+        changed = True
+        if before_exists:
+            try:
+                _build_split_archive_for_compare(
+                    entry, archive_path, after_path, before_copy
+                )
+                changed = not _xlsx_content_equal(before_copy, after_copy)
+            except Exception as e:
+                warning_lines.append(f"{entry}：留档临时拆分失败，跳过该表比较（{e}）")
+                if os.path.isfile(before_copy):
+                    os.remove(before_copy)
+                if os.path.isfile(after_copy):
+                    os.remove(after_copy)
+                continue
+        else:
+            warning_lines.append(f"{entry}：留档中没有同名文件，按新增表处理")
+
+        if not changed:
+            if os.path.isfile(before_copy):
+                os.remove(before_copy)
+            if os.path.isfile(after_copy):
+                os.remove(after_copy)
+            continue
+
+        changed_entries.append(entry)
+
+    return changed_entries, warning_lines, before_dir, after_dir
+
+
+def _format_entry_list(entries, max_items=30):
+    lines = [f"  • {entry}" for entry in entries[:max_items]]
+    if len(entries) > max_items:
+        lines.append(f"  …其余 {len(entries) - max_items} 个表")
+    return "\n".join(lines)
+
+
+def confirm_continue_without_bcompare(reason):
+    """BCompare 未执行时，由用户决定继续导回或停止。"""
+    return show_yes_no(
+        "BCompare 未执行",
+        f"{reason}\n\n是否跳过本次比较，继续导回 UE？"
+    )
+
+
+def run_bcompare_before_import(entries):
+    """
+    仅比较本次可导入且实际变化的表。
+    返回 (是否继续导入, 状态文字)。
+    """
+    if not os.path.isdir(ARCHIVE_BASE):
+        return (
+            confirm_continue_without_bcompare(
+                f"找不到导出留档文件夹：\n{ARCHIVE_BASE}"
+            ),
+            "未执行（找不到留档文件夹）"
+        )
+
+    try:
+        changed, warnings, before_dir, after_dir = prepare_bcompare_session(entries)
+    except Exception as e:
+        unreal.log_error(f"BCompare 比较目录准备失败：{e}")
+        return (
+            confirm_continue_without_bcompare(f"比较目录准备失败：\n{e}"),
+            "未执行（比较目录准备失败）"
+        )
+
+    if warnings:
+        for warning in warnings:
+            unreal.log_warning(f"BCompare：{warning}")
+
+    if not changed:
+        warning_text = ""
+        if warnings:
+            warning_text = (
+                "\n\n比较准备提示：\n"
+                + "\n".join(f"  • {line}" for line in warnings[:10])
+            )
+        continue_import = show_yes_no(
+            "本次没有检测到修改",
+            f"本次准备导回 {len(entries)} 个表，和导出留档对比后未发现内容变化。\n\n"
+            f"{warning_text}\n\n"
+            f"是否仍然继续导回 UE？"
+        )
+        return (
+            continue_import,
+            f"已检查，实际变化 0 个表"
+        )
+
+    bcompare_path = get_saved_bcompare_path()
+    if not bcompare_path:
+        bcompare_path = choose_bcompare_exe()
+    if not bcompare_path:
+        return (
+            confirm_continue_without_bcompare("本次没有选择 BCompare.exe。"),
+            f"未执行（未选择程序；检测到 {len(changed)} 个变化表）"
+        )
+
+    try:
+        process = subprocess.Popen([
+            bcompare_path,
+            "/solo",
+            before_dir,
+            after_dir,
+        ])
+        process.wait()
+    except Exception as e:
+        unreal.log_error(f"启动 BCompare 失败：{e}")
+        return (
+            confirm_continue_without_bcompare(f"启动 BCompare 失败：\n{e}"),
+            f"启动失败（检测到 {len(changed)} 个变化表）"
+        )
+
+    warning_text = ""
+    if warnings:
+        warning_text = (
+            f"\n\n比较准备提示：\n"
+            + "\n".join(f"  • {line}" for line in warnings[:10])
+        )
+    continue_import = show_yes_no(
+        "确认导回 UE",
+        f"BCompare 已关闭。\n\n"
+        f"本次勾选并可导入：{len(entries)} 个表\n"
+        f"其中检测到变化：{len(changed)} 个表\n\n"
+        f"【即将导回的表格】\n{_format_entry_list(entries)}"
+        f"{warning_text}\n\n"
+        f"是否确认导回 UE？"
+    )
+    return (
+        continue_import,
+        f"已比较 {len(changed)} 个实际变化表"
+    )
+
+
 # 主流程
 # ══════════════════════════════════════════════════════
 
@@ -1430,12 +1971,12 @@ def run_preflight_check():
 if not run_preflight_check():
     unreal.log("脚本终止")
 else:
-    table_list = load_table_list()
+    table_list, use_bcompare = load_table_list()
     if not table_list:
         unreal.log_warning("导入列表为空，退出")
     else:
-        total = len(table_list)
-        unreal.log(f"导入列表共 {total} 个表")
+        selected_total = len(table_list)
+        unreal.log(f"导入列表共 {selected_total} 个表")
 
         merge_success, merge_fail   = [], []
         limit_skipped               = []
@@ -1444,8 +1985,68 @@ else:
         direct_import_fail          = []
         direct_import_reports       = []
         import_success, import_fail = [], []
+        bcompare_status             = "本次未使用"
 
-        # ── 第一步：合表 ──
+        # ── 第一步：P4 冲突检测 ──
+        unreal.log("\n正在检测 P4 签出状态...")
+        can_prepare = []
+        conflicts = []
+        if SOURCE_CONTROL_HELPERS is None:
+            unreal.log_warning(
+                "当前 UE 未提供 SourceControlHelpers，已跳过 P4 冲突检测"
+            )
+            can_prepare = list(table_list)
+        else:
+            with unreal.ScopedSlowTask(selected_total, "检测 P4 冲突...") as task:
+                task.make_dialog(False)
+                for entry in table_list:
+                    task.enter_progress_frame(1, f"检测：{entry}")
+                    ue_asset_path = f"{UE_BASE_PATH}/{entry}"
+                    try:
+                        state = SOURCE_CONTROL_HELPERS.query_file_state(ue_asset_path)
+                        if state and state.is_checked_out_other:
+                            other = getattr(state, 'other_user_checked_out', '其他人')
+                            conflicts.append((entry, str(other)))
+                        else:
+                            can_prepare.append(entry)
+                    except Exception as e:
+                        unreal.log_warning(f"P4检测失败 {entry}: {e}，默认允许导入")
+                        can_prepare.append(entry)
+
+        # ── 第二步：冲突确认 ──
+        if conflicts:
+            conflict_lines = "\n".join(
+                [f"  • {entry}（签出人：{user}）" for entry, user in conflicts]
+            )
+            continue_after_conflicts = show_yes_no(
+                "P4 签出冲突",
+                f"以下 {len(conflicts)} 个表已被他人签出，无法导入：\n\n"
+                f"{conflict_lines}\n\n"
+                f"是否跳过冲突表，继续处理其余 {len(can_prepare)} 个表？"
+            )
+            if not continue_after_conflicts:
+                unreal.log("用户选择中止，导入取消")
+                can_prepare = []
+            else:
+                for entry, user in conflicts:
+                    import_fail.append(f"{entry}（已被 {user} 签出）")
+                unreal.log(
+                    f"跳过 {len(conflicts)} 个冲突表，继续处理 {len(can_prepare)} 个"
+                )
+
+        # ── 第三步：可选 BCompare 对比（合表之前） ──
+        if use_bcompare and can_prepare:
+            continue_import, bcompare_status = run_bcompare_before_import(can_prepare)
+            if not continue_import:
+                unreal.log("用户在 BCompare 确认阶段取消导回")
+                can_prepare = []
+        elif use_bcompare:
+            bcompare_status = "未执行（没有可导入的表）"
+
+        table_list = can_prepare
+        total = len(table_list)
+
+        # ── 第四步：合表 ──
         with unreal.ScopedSlowTask(total, "正在合表...") as task:
             task.make_dialog(True)
             for entry in table_list:
@@ -1505,46 +2106,8 @@ else:
                 unreal.AppMsgType.OK
             )
         else:
-            # ── 第二步：P4 冲突检测 ──
-            unreal.log("\n正在检测 P4 签出状态...")
-            with unreal.ScopedSlowTask(len(merge_success), "检测 P4 冲突...") as task:
-                task.make_dialog(False)
-                can_import = []
-                conflicts  = []
-                for entry in merge_success:
-                    task.enter_progress_frame(1, f"检测：{entry}")
-                    ue_asset_path = f"{UE_BASE_PATH}/{entry}"
-                    try:
-                        state = unreal.SourceControlHelpers.query_file_state(ue_asset_path)
-                        if state and state.is_checked_out_other:
-                            other = getattr(state, 'other_user_checked_out', '其他人')
-                            conflicts.append((entry, str(other)))
-                        else:
-                            can_import.append(entry)
-                    except Exception as e:
-                        unreal.log_warning(f"P4检测失败 {entry}: {e}，默认允许导入")
-                        can_import.append(entry)
-
-            # ── 第三步：冲突弹窗 ──
-            if conflicts:
-                conflict_lines = "\n".join([f"  • {e}（签出人：{u}）" for e, u in conflicts])
-                msg = (
-                    f"以下 {len(conflicts)} 个表已被他人签出，无法导入：\n\n"
-                    f"{conflict_lines}\n\n"
-                    f"是否跳过冲突表，继续导入其余 {len(can_import)} 个表？"
-                )
-                choice = unreal.EditorDialog.show_message(
-                    "P4 签出冲突", msg, unreal.AppMsgType.YesNo
-                )
-                if choice != unreal.AppReturnType.Yes:
-                    unreal.log("用户选择中止，导入取消")
-                    can_import = []
-                else:
-                    for entry, user in conflicts:
-                        import_fail.append(f"{entry}（已被 {user} 签出）")
-                    unreal.log(f"跳过 {len(conflicts)} 个冲突表，继续导入 {len(can_import)} 个")
-
-            # ── 第四步：导入 ──
+            # ── 第五步：导入 ──
+            can_import = list(merge_success)
             if can_import:
                 with unreal.ScopedSlowTask(len(can_import), "正在导入到 UE...") as task:
                     task.make_dialog(True)
@@ -1581,6 +2144,7 @@ else:
                 f"【直接内存导入】成功 {len(direct_import_success)} 个，"
                 f"失败 {len(direct_import_fail)} 个\n"
                 f"【超限导回功能】{direct_feature_status}\n"
+                f"【BCompare】{bcompare_status}\n"
                 f"【导入】成功 {len(import_success)} 个，失败 {len(import_fail)} 个\n"
                 f"【超限跳过】{len(limit_skipped)} 个表"
             )
