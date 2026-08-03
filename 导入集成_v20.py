@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-合表并导入 v1.5（导入集成_v19）
+合表并导入 v1.5（导入集成_v20）
 流程：
   1. 扫描 DataTables_Cehua 下所有表，筛选出在 UE 中有对应资产的【可导入表】
   2. 弹出勾选界面（tkinter），让用户勾选本次要导入的表，并选择本次是否使用 BCompare
@@ -312,9 +312,28 @@ def select_tables_gui(grouped, preselected=None):
     rows_by_entry  = {}   # entry -> Checkbutton widget
     group_headers  = {}   # 分组名 -> 分组标题行 Frame
 
+    def get_search_tokens():
+        """将搜索内容按空白拆成关键词；所有关键词都命中时才显示。"""
+        return search_var.get().strip().lower().split()
+
+    def entry_matches(entry):
+        tokens = get_search_tokens()
+        search_text = entry.lower()
+        return all(token in search_text for token in tokens)
+
+    def get_visible_entries():
+        return [entry for entry in vars_by_entry if entry_matches(entry)]
+
     def update_count():
-        n = sum(v.get() for v in vars_by_entry.values())
-        count_label.config(text=f"共 {len(vars_by_entry)} 个可导入表，已选 {n} 个")
+        visible = get_visible_entries()
+        visible_selected = sum(vars_by_entry[e].get() for e in visible)
+        total_selected = sum(v.get() for v in vars_by_entry.values())
+        count_label.config(
+            text=(
+                f"找到 {len(visible)} 个，当前结果已选 {visible_selected} 个；"
+                f"全部 {len(vars_by_entry)} 个，已选 {total_selected} 个"
+            )
+        )
 
     def make_group_setter(group, value):
         def _apply():
@@ -345,29 +364,32 @@ def select_tables_gui(grouped, preselected=None):
             rows_by_entry[entry] = cb
 
     def apply_filter(*_):
-        """按关键字过滤；tkinter 的 pack_forget 后重新 pack 会追加到末尾，
+        """按一个或多个关键词过滤；tkinter 的 pack_forget 后重新 pack 会追加到末尾，
         所以这里先把所有条目/标题整体撤下，再按分组顺序依次重新排布，避免顺序错乱。"""
-        kw = search_var.get().strip().lower()
         for group, entries in grouped.items():
             group_headers[group].pack_forget()
             for entry in entries:
                 rows_by_entry[entry].pack_forget()
         for group, entries in grouped.items():
-            visible = [e for e in entries if kw in e.lower()]
+            visible = [e for e in entries if entry_matches(e)]
             if not visible:
                 continue
             group_headers[group].pack(fill="x", pady=(8, 2))
             for entry in visible:
                 rows_by_entry[entry].pack(fill="x", anchor="w", padx=(24, 0))
+        root.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.yview_moveto(0)
+        update_count()
     search_var.trace_add("write", apply_filter)
 
     def select_all():
-        for v in vars_by_entry.values():
-            v.set(True)
+        for entry in get_visible_entries():
+            vars_by_entry[entry].set(True)
 
     def select_none():
-        for v in vars_by_entry.values():
-            v.set(False)
+        for entry in get_visible_entries():
+            vars_by_entry[entry].set(False)
 
     tk.Button(top, text="全选",   command=select_all).pack(side="left", padx=2)
     tk.Button(top, text="全不选", command=select_none).pack(side="left", padx=2)
