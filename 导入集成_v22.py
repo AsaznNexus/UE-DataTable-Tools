@@ -1,0 +1,2530 @@
+# -*- coding: utf-8 -*-
+"""
+合表并导入 v1.7（导入集成_v22）
+流程：
+  1. 扫描 DataTables_Cehua 下所有表，筛选出在 UE 中有对应资产的【可导入表】
+  2. 弹出勾选界面（tkinter），让用户勾选本次要导入的表，并选择本次是否使用 BCompare
+  3. P4 冲突检测：找出被他人签出的表
+  4. 可选：将导出留档临时拆成策划格式，只比较本次勾选且实际变化的表
+  5. 按确认结果合表：DataTables_Cehua → DataTables_Export
+  6. 导入：DataTables_Export → UE
+
+说明：
+  - 导出/拆表由 操作列表.txt 决定（拆表范围，通常较大），本脚本不依赖
+  - 导入列表.txt 仅作为“默认预勾选”的参考，不再是唯一入口
+  - 实际导入范围以本次勾选界面的选择为准
+  - BCompare 为可选功能；程序路径只通过手动选择，并保存到脚本目录配置文件
+  - BCompare 两侧统一使用策划拆分格式，避免数组序列化格式造成误报
+  - 兼容不同 UE Python 枚举命名；缺少 SourceControlHelpers 时自动跳过 P4 检测
+"""
+
+import unreal
+import os
+import re
+import sys
+import json
+import shutil
+import subprocess
+
+
+def _resolve_unreal_enum(enum_type, *candidate_names):
+    """兼容 UE Python 枚举在不同引擎版本中的命名差异。"""
+    for name in candidate_names:
+        if hasattr(enum_type, name):
+            return getattr(enum_type, name)
+    enum_name = getattr(enum_type, "__name__", str(enum_type))
+    raise RuntimeError(
+        f"当前 UE 的 {enum_name} 缺少兼容枚举：{', '.join(candidate_names)}"
+    )
+
+
+APP_MSG_YES_NO = _resolve_unreal_enum(unreal.AppMsgType, "YES_NO", "YesNo")
+APP_RETURN_YES = _resolve_unreal_enum(unreal.AppReturnType, "YES", "Yes")
+SOURCE_CONTROL_HELPERS = getattr(unreal, "SourceControlHelpers", None)
+
+
+def show_yes_no(title, message):
+    """显示是/否确认框，并统一返回布尔值。"""
+    choice = unreal.EditorDialog.show_message(title, message, APP_MSG_YES_NO)
+    return choice == APP_RETURN_YES
+
+# ── 依赖检测：openpyxl ────────────────────────────────
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill
+except ImportError:
+    unreal.log_error("未检测到 openpyxl")
+    unreal.EditorDialog.show_message(
+        "缺少依赖：openpyxl",
+        "请先运行桌面上的「安装环境.py」脚本安装依赖，\n"
+        "安装完成后再运行本脚本。",
+        unreal.AppMsgType.OK
+    )
+    raise SystemExit("缺少依赖 openpyxl")
+
+# ── 依赖检测：tkinter ─────────────────────────────────
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+except ImportError:
+    unreal.log_error("未检测到 tkinter")
+    unreal.EditorDialog.show_message(
+        "缺少依赖：tkinter",
+        "当前 UE 内置 Python 环境未包含 tkinter 模块，\n"
+        "无法弹出勾选界面，请联系技术美术检查 Python 环境配置。",
+        unreal.AppMsgType.OK
+    )
+    raise SystemExit("缺少依赖 tkinter")
+
+# ── 路径配置 ──────────────────────────────────────────
+BASE_DIR         = os.path.dirname(os.path.abspath(__file__)).replace("\\", "/")
+CEHUA_BASE       = f"{BASE_DIR}/DataTables_Cehua/"
+EXPORT_BASE      = f"{BASE_DIR}/DataTables_Export/"
+ARCHIVE_BASE     = f"{BASE_DIR}/DataTables_Export_留档/"
+LIST_FILE        = f"{BASE_DIR}/操作列表.txt"      # 拆表范围（导出脚本用，本脚本不依赖）
+IMPORT_LIST_FILE = f"{BASE_DIR}/导入列表.txt"      # 导入范围（本脚本实际使用）
+TOOL_CONFIG_FILE = f"{BASE_DIR}/DataTable工具配置.json"
+BCOMPARE_SESSION_BASE = f"{BASE_DIR}/BCompare_本次导入/"
+UE_BASE_PATH = "/Game/GDataTables"
+EXCEL_CELL_CHAR_LIMIT = 32767
+DEFENSE_REWARD_TABLE = "DefenseRewardDefineT_S"
+DEFENSE_REWARD_FIELD = "ScoreRewardPool"
+DEFENSE_REWARD_MARKER = "DEFENSE_REWARD"
+DIRECT_IMPORT_TABLES = {"DifficultyDefineT", DEFENSE_REWARD_TABLE}
+STRUCT_SPLIT_FIELDS = {
+    ("AnalyticsActionDefineT", "ActionData"),
+    ("InGameScoreGroupDefineT", "ScoreColor"),
+    ("InGameScoreActionDefineT", "Rule"),
+}
+SINGLE_STRUCT_FIELD_SCHEMAS = {
+    ("AnalyticsActionDefineT", "ActionData"): {
+        "AnalyticsKeyName": "STRING",
+        "MsgID": "VALUE",
+        "DefaultValue": "STRING",
+        "ProcessType": "VALUE",
+    },
+    ("InGameScoreGroupDefineT", "ScoreColor"): {
+        "R": "VALUE",
+        "G": "VALUE",
+        "B": "VALUE",
+        "A": "VALUE",
+    },
+    ("InGameScoreActionDefineT", "Rule"): {
+        "RuleType": "VALUE",
+        "AnalyticsColumnName": "STRING",
+        "ScorePerCount": "VALUE",
+        "Ladders": "RAW",
+        "IntervalSeconds": "VALUE",
+        "ScorePerInterval": "VALUE",
+    },
+}
+
+
+class ExcelCellLimitError(Exception):
+    """合表后单元格超过 Excel 字符上限时抛出，阻止该表继续导入。"""
+    def __init__(self, details):
+        self.details = details
+        super().__init__(f"有 {len(details)} 个单元格超过 {EXCEL_CELL_CHAR_LIMIT} 字符")
+
+
+def is_direct_import_table(entry):
+    """只对指定特例表启用拆分表直接内存导入。"""
+    return os.path.basename(str(entry).replace("\\", "/")) in DIRECT_IMPORT_TABLES
+
+
+def is_defense_reward_table(entry):
+    """判断是否为二级奖励数组专用表。"""
+    base_name = os.path.basename(str(entry).replace("\\", "/"))
+    return os.path.splitext(base_name)[0] == DEFENSE_REWARD_TABLE
+
+
+def load_tool_config():
+    """读取工具配置；配置缺失或损坏时返回空配置。"""
+    if not os.path.isfile(TOOL_CONFIG_FILE):
+        return {}
+    try:
+        with open(TOOL_CONFIG_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        unreal.log_warning(f"读取工具配置失败，将使用空配置：{e}")
+        return {}
+
+
+def save_bcompare_path(exe_path):
+    """保存 BCompare.exe 路径，同时保留配置文件中的其他项目。"""
+    config = load_tool_config()
+    config["bcompare_path"] = os.path.abspath(exe_path)
+    temp_path = TOOL_CONFIG_FILE + ".tmp"
+    try:
+        with open(temp_path, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+        os.replace(temp_path, TOOL_CONFIG_FILE)
+        return True, ""
+    except Exception as e:
+        try:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+        except Exception:
+            pass
+        return False, str(e)
+
+
+def get_saved_bcompare_path():
+    """返回仍然有效的已保存路径；不执行注册表、PATH 或常见目录检测。"""
+    path = load_tool_config().get("bcompare_path")
+    if not isinstance(path, str) or not path.strip():
+        return None
+    path = os.path.abspath(path.strip())
+    if os.path.isfile(path) and os.path.basename(path).lower() == "bcompare.exe":
+        return path
+    return None
+
+
+def choose_bcompare_exe(parent=None):
+    """由用户手动选择 BCompare.exe，选择成功后永久保存路径。"""
+    dialog_root = None
+    try:
+        if parent is None:
+            dialog_root = tk.Tk()
+            dialog_root.withdraw()
+            dialog_root.attributes("-topmost", True)
+            parent = dialog_root
+        path = filedialog.askopenfilename(
+            parent=parent,
+            title="请选择 BCompare.exe",
+            filetypes=[("Beyond Compare", "BCompare.exe"), ("可执行文件", "*.exe")],
+        )
+    finally:
+        if dialog_root is not None:
+            dialog_root.destroy()
+    if not path:
+        return None
+    path = os.path.abspath(path)
+    if not os.path.isfile(path) or os.path.basename(path).lower() != "bcompare.exe":
+        unreal.EditorDialog.show_message(
+            "BCompare 路径无效",
+            "请选择 Beyond Compare 安装目录中的 BCompare.exe。",
+            unreal.AppMsgType.OK
+        )
+        return None
+    saved, error = save_bcompare_path(path)
+    if not saved:
+        unreal.EditorDialog.show_message(
+            "配置保存失败",
+            f"BCompare 本次仍可使用，但程序路径未能永久保存：\n{error}",
+            unreal.AppMsgType.OK
+        )
+    return path
+
+
+# ══════════════════════════════════════════════════════
+# 读取导入列表：扫描全量表 + 勾选界面
+# ══════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════
+# 读取导入列表：按文件夹分组扫描 + 分组勾选界面
+# ══════════════════════════════════════════════════════
+
+def scan_importable_tables(cehua_base, ue_base_path):
+    """
+    扫描 DataTables_Cehua 下所有 xlsx（支持子文件夹），按【顶层文件夹】分组，
+    并筛选出在 UE 中已存在对应 DataTable 资产的表。
+    返回 dict：{ 分组名: [entry, entry, ...] }，分组名和组内均按名称排序。
+    不在任何子文件夹下的表归入 “（未分类）” 分组。
+    """
+    groups = {}
+    if not os.path.exists(cehua_base):
+        return {}
+
+    for root, _, files in os.walk(cehua_base):
+        for fn in files:
+            if not fn.lower().endswith(".xlsx") or fn.startswith("~$"):
+                continue  # 跳过非xlsx及Excel打开时产生的临时锁文件
+            full_path = os.path.join(root, fn).replace("\\", "/")
+            rel = os.path.relpath(full_path, cehua_base).replace("\\", "/")
+            entry = rel[:-5]  # 去掉 .xlsx 后缀
+
+            ue_asset_path = f"{ue_base_path}/{entry}"
+            try:
+                exists = unreal.EditorAssetLibrary.does_asset_exist(ue_asset_path)
+            except Exception as e:
+                unreal.log_warning(f"资产存在性查询失败 {entry}：{e}，默认保留候选")
+                exists = True
+            if not exists:
+                continue
+
+            group = entry.split("/", 1)[0] if "/" in entry else "（未分类）"
+            groups.setdefault(group, []).append(entry)
+
+    return {g: sorted(es) for g, es in sorted(groups.items())}
+
+
+def load_default_selection(import_list_file):
+    """读取旧版 导入列表.txt（如果存在），作为勾选界面的默认预勾选项。"""
+    if not os.path.exists(import_list_file):
+        return set()
+    with open(import_list_file, "r", encoding="utf-8") as f:
+        lines = [l.strip() for l in f.readlines()]
+    return {
+        l.replace("\\", "/").strip()
+        for l in lines
+        if l and not l.startswith("#")
+    }
+
+
+def select_tables_gui(grouped, preselected=None):
+    """
+    弹出 tkinter 勾选窗口，按文件夹分组展示候选表（类似 操作列表.txt 的
+    “—— 分组名 ——” 分段风格），支持按组整体勾选/清空、全局搜索过滤。
+    grouped: { 分组名: [entry, ...] }
+    返回用户确认勾选的 entry 列表（跨所有组）；用户取消/关闭窗口返回 None。
+    """
+    preselected = preselected or set()
+    result = {"selected": None, "use_bcompare": False}
+
+    root = tk.Tk()
+    root.title("选择要导入的表")
+    root.geometry("600x740")
+    root.attributes("-topmost", True)
+
+    # ── 顶部：搜索框 + 全局全选/全不选 ──
+    top = tk.Frame(root)
+    top.pack(fill="x", padx=10, pady=(10, 5))
+
+    tk.Label(top, text="搜索：").pack(side="left")
+    search_var = tk.StringVar()
+    tk.Entry(top, textvariable=search_var).pack(side="left", fill="x", expand=True, padx=(0, 10))
+
+    count_label = tk.Label(root, text="", anchor="w")
+    count_label.pack(fill="x", padx=10)
+
+    # ── 中间：可滚动分组勾选列表 ──
+    list_frame = tk.Frame(root)
+    list_frame.pack(fill="both", expand=True, padx=10, pady=5)
+
+    canvas    = tk.Canvas(list_frame, highlightthickness=0)
+    scrollbar = tk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+    inner     = tk.Frame(canvas)
+
+    inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=inner, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
+    canvas.pack(side="left", fill="both", expand=True)
+    scrollbar.pack(side="right", fill="y")
+
+    def _on_mousewheel(event):
+        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+    canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+    vars_by_entry  = {}   # entry -> BooleanVar
+    rows_by_entry  = {}   # entry -> Checkbutton widget
+    group_headers  = {}   # 分组名 -> 分组标题行 Frame
+
+    def get_search_tokens():
+        """将搜索内容按空白拆成关键词；所有关键词都命中时才显示。"""
+        return search_var.get().strip().lower().split()
+
+    def entry_matches(entry):
+        tokens = get_search_tokens()
+        search_text = entry.lower()
+        return all(token in search_text for token in tokens)
+
+    def get_visible_entries():
+        return [entry for entry in vars_by_entry if entry_matches(entry)]
+
+    def update_count():
+        visible = get_visible_entries()
+        visible_selected = sum(vars_by_entry[e].get() for e in visible)
+        total_selected = sum(v.get() for v in vars_by_entry.values())
+        count_label.config(
+            text=(
+                f"找到 {len(visible)} 个，当前结果已选 {visible_selected} 个；"
+                f"全部 {len(vars_by_entry)} 个，已选 {total_selected} 个"
+            )
+        )
+
+    def make_group_setter(group, value):
+        def _apply():
+            for e in grouped[group]:
+                vars_by_entry[e].set(value)
+        return _apply
+
+    # ── 按组构建：分组标题 + 组内缩进勾选项 ──
+    for group, entries in grouped.items():
+        header = tk.Frame(inner, bg="#2F5496")
+        header.pack(fill="x", pady=(8, 2))
+        tk.Label(header, text=f"—— {group} ——", bg="#2F5496", fg="white",
+                 anchor="w").pack(side="left", fill="x", expand=True, padx=6, pady=3)
+        tk.Button(header, text="组清空", command=make_group_setter(group, False)
+                  ).pack(side="right", padx=(2, 6), pady=2)
+        tk.Button(header, text="组全选", command=make_group_setter(group, True)
+                  ).pack(side="right", padx=2, pady=2)
+        group_headers[group] = header
+
+        for entry in entries:
+            var = tk.BooleanVar(value=(entry in preselected))
+            var.trace_add("write", lambda *a: update_count())
+            # 组内只显示去掉分组前缀的短名，层级感来自缩进
+            short_name = entry.split("/", 1)[1] if "/" in entry else entry
+            cb = tk.Checkbutton(inner, text=short_name, variable=var, anchor="w", justify="left")
+            cb.pack(fill="x", anchor="w", padx=(24, 0))
+            vars_by_entry[entry] = var
+            rows_by_entry[entry] = cb
+
+    def apply_filter(*_):
+        """按一个或多个关键词过滤；tkinter 的 pack_forget 后重新 pack 会追加到末尾，
+        所以这里先把所有条目/标题整体撤下，再按分组顺序依次重新排布，避免顺序错乱。"""
+        for group, entries in grouped.items():
+            group_headers[group].pack_forget()
+            for entry in entries:
+                rows_by_entry[entry].pack_forget()
+        for group, entries in grouped.items():
+            visible = [e for e in entries if entry_matches(e)]
+            if not visible:
+                continue
+            group_headers[group].pack(fill="x", pady=(8, 2))
+            for entry in visible:
+                rows_by_entry[entry].pack(fill="x", anchor="w", padx=(24, 0))
+        root.update_idletasks()
+        canvas.configure(scrollregion=canvas.bbox("all"))
+        canvas.yview_moveto(0)
+        update_count()
+    search_var.trace_add("write", apply_filter)
+
+    def select_all():
+        for entry in get_visible_entries():
+            vars_by_entry[entry].set(True)
+
+    def select_none():
+        for entry in get_visible_entries():
+            vars_by_entry[entry].set(False)
+
+    tk.Button(top, text="全选",   command=select_all).pack(side="left", padx=2)
+    tk.Button(top, text="全不选", command=select_none).pack(side="left", padx=2)
+
+    # ── BCompare：本次可选，路径只允许用户手动指定 ──
+    compare_frame = tk.LabelFrame(root, text="导回前比较")
+    compare_frame.pack(fill="x", padx=10, pady=(4, 0))
+
+    saved_bcompare = get_saved_bcompare_path()
+    use_bcompare_var = tk.BooleanVar(value=bool(saved_bcompare))
+    bcompare_path_var = tk.StringVar(
+        value=saved_bcompare or "尚未选择 BCompare.exe（本次可取消勾选直接导回）"
+    )
+
+    tk.Checkbutton(
+        compare_frame,
+        text="本次使用 BCompare（仅显示本次勾选且实际变化的表）",
+        variable=use_bcompare_var,
+        anchor="w",
+        justify="left",
+    ).pack(fill="x", padx=8, pady=(5, 2))
+
+    path_row = tk.Frame(compare_frame)
+    path_row.pack(fill="x", padx=8, pady=(0, 6))
+    tk.Label(
+        path_row,
+        textvariable=bcompare_path_var,
+        anchor="w",
+        justify="left",
+        wraplength=430,
+        fg="#555555",
+    ).pack(side="left", fill="x", expand=True)
+
+    def reselect_bcompare():
+        path = choose_bcompare_exe(root)
+        if path:
+            bcompare_path_var.set(path)
+            use_bcompare_var.set(True)
+
+    tk.Button(
+        path_row,
+        text="选择/更换程序",
+        command=reselect_bcompare,
+    ).pack(side="right", padx=(8, 0))
+
+    # ── 底部：确定 / 取消 ──
+    bottom = tk.Frame(root)
+    bottom.pack(fill="x", padx=10, pady=10)
+
+    def on_confirm():
+        result["selected"] = [e for e, v in vars_by_entry.items() if v.get()]
+        result["use_bcompare"] = bool(use_bcompare_var.get())
+        root.destroy()
+
+    def on_cancel():
+        result["selected"] = None
+        root.destroy()
+
+    tk.Button(bottom, text="取消", width=10, command=on_cancel).pack(side="right", padx=5)
+    tk.Button(bottom, text="确定导入", width=10, command=on_confirm,
+              bg="#2F5496", fg="white").pack(side="right", padx=5)
+
+    root.protocol("WM_DELETE_WINDOW", on_cancel)
+    update_count()
+    root.mainloop()
+
+    return result["selected"], result["use_bcompare"]
+
+
+def load_table_list():
+    grouped = scan_importable_tables(CEHUA_BASE, UE_BASE_PATH)
+    total = sum(len(es) for es in grouped.values())
+    if total == 0:
+        msg = (f"在以下目录未找到任何“可导入”的表\n"
+               f"（需要同时满足：存在 xlsx 文件 且 UE 中已有对应 DataTable 资产）：\n{CEHUA_BASE}")
+        unreal.log_warning(msg)
+        unreal.EditorDialog.show_message("无可导入的表", msg, unreal.AppMsgType.OK)
+        return [], False
+
+    preselected = load_default_selection(IMPORT_LIST_FILE)
+    selected, use_bcompare = select_tables_gui(grouped, preselected)
+
+    if selected is None:
+        unreal.log_warning("用户取消了表选择")
+        return [], False
+    if not selected:
+        unreal.log_warning("未勾选任何表")
+    return selected, use_bcompare
+
+
+# ══════════════════════════════════════════════════════
+# 【第一部分】合表核心逻辑
+# ══════════════════════════════════════════════════════
+
+def parse_subfield_name(s):
+    if not s:
+        return None
+    s = str(s).strip()
+    if not s:
+        return None
+    m = re.match(r'^(.+?)_(\d+)$', s)
+    if m:
+        return (m.group(1), int(m.group(2)))
+    return (s, 0)
+
+
+def analyze_cehua_headers(row1, row2, row3=None, asset_name=""):
+    """
+    解析双行表头，返回列计划列表，元素格式：
+      ('normal',       ci, field)
+      ('tmap_key',     ci, field, arr_idx)   — TMap Key 列
+      ('tmap_val',     ci, field, arr_idx)   — TMap Value 列
+      ('tset_item',    ci, field, arr_idx)   — TSet 标量元素列
+      ('array_scalar', ci, field, arr_idx)   — 普通标量数组列
+      ('array_struct', ci, field, arr_idx, subfield) — 普通结构体数组子字段列
+      ('struct_*',     ci, field, subfield)  — 指定单结构体子字段列
+    """
+    plan = []
+    for ci, (f1, f2) in enumerate(zip(row1, row2)):
+        f1 = str(f1).strip() if f1 else ""
+        f2 = str(f2).strip() if f2 else ""
+        if not f2:
+            plan.append(('normal', ci, f1))
+            continue
+        marker = row3[ci] if row3 is not None and ci < len(row3) else None
+        marker = str(marker).strip().upper() if marker is not None else ""
+        if (
+            (asset_name, f1) in STRUCT_SPLIT_FIELDS and
+            marker in ("STRUCT_STRING", "STRUCT_VALUE", "STRUCT_RAW")
+        ):
+            plan.append((marker.lower(), ci, f1, f2))
+            continue
+        parsed = parse_subfield_name(f2)
+        if parsed is None:
+            plan.append(('normal', ci, f1))
+            continue
+        subfield, arr_idx = parsed
+        # TMap Key / Value
+        if subfield == 'key':
+            plan.append(('tmap_key', ci, f1, arr_idx))
+        elif subfield == 'val':
+            plan.append(('tmap_val', ci, f1, arr_idx))
+        # TSet item
+        elif subfield == 'item':
+            plan.append(('tset_item', ci, f1, arr_idx))
+        # 普通标量数组
+        elif subfield == 'value':
+            plan.append(('array_scalar', ci, f1, arr_idx))
+        # 普通结构体数组
+        else:
+            plan.append(('array_struct', ci, f1, arr_idx, subfield))
+    return plan
+
+
+def get_split_fields(plan):
+    seen, fields = set(), []
+    split_types = {
+        'array_struct', 'array_scalar', 'tmap_key', 'tmap_val', 'tset_item',
+        'struct_string', 'struct_value', 'struct_raw'
+    }
+    for item in plan:
+        if item[0] in split_types:
+            fname = item[2]
+            if fname not in seen:
+                seen.add(fname)
+                fields.append(fname)
+    return fields
+
+
+UE_TEXT_EXPRESSION_PREFIXES = (
+    "NSLOCTEXT(",
+    "LOCTEXT(",
+    "INVTEXT(",
+)
+
+INVALID_QUOTED_UE_TEXT_PATTERN = re.compile(
+    r'=\s*(?:\\)?"(?:NSLOCTEXT|LOCTEXT|INVTEXT)\('
+)
+
+
+def _is_ue_text_expression(v):
+    """判断是否为 UE 原生本地化文本表达式。"""
+    text = str(v) if v is not None else ""
+    return text.lstrip().startswith(UE_TEXT_EXPRESSION_PREFIXES)
+
+
+def _needs_quotes(v):
+    """判断 UE CSV struct 写法中该值是否需要加引号"""
+    v = str(v) if v is not None else ""
+    if v.startswith("(") or v.startswith("{") or _is_ue_text_expression(v):
+        return False
+    try:
+        float(v)
+        return False
+    except ValueError:
+        pass
+    if v.lower() in ("true", "false", "none"):
+        return False
+    return True
+
+
+def _validate_no_quoted_ue_text_expressions(rows, headers):
+    """
+    拦截 SkillEffectDesc=\"NSLOCTEXT(...)\" 这类无法被 UE
+    结构体解析器正确读取的错误包装。
+    """
+    issues = []
+    for row in rows:
+        row_name = row[0] if row and row[0] is not None else "<空行名>"
+        for ci, value in enumerate(row):
+            if value is None:
+                continue
+            if INVALID_QUOTED_UE_TEXT_PATTERN.search(str(value)):
+                field_name = headers[ci] if ci < len(headers) else f"第 {ci + 1} 列"
+                issues.append(f"行 '{row_name}' 字段 '{field_name}'")
+                if len(issues) >= 10:
+                    break
+        if len(issues) >= 10:
+            break
+
+    if issues:
+        detail = "；".join(issues)
+        raise ValueError(
+            "检测到 UE 本地化文本被错误加上外层引号，"
+            f"已停止合表/导入：{detail}"
+        )
+
+
+def _quote_single_struct_string(v):
+    """为指定单结构体的字符串子字段恢复 UE 引号。"""
+    text = str(v) if v is not None else ""
+    result = []
+    escaped = False
+    for ch in text:
+        if ch == '"' and not escaped:
+            result.append('\\"')
+        else:
+            result.append(ch)
+        if ch == "\\":
+            escaped = not escaped
+        else:
+            escaped = False
+    return f'"{"".join(result)}"'
+
+
+def _split_single_struct_assignments(inner):
+    """按顶层逗号拆分单结构体字段，保留嵌套数组和引号内容。"""
+    tokens, current = [], []
+    depth = 0
+    in_q = False
+    escaped = False
+    for ch in inner:
+        if in_q:
+            current.append(ch)
+            if escaped:
+                escaped = False
+            elif ch == "\\":
+                escaped = True
+            elif ch == '"':
+                in_q = False
+        elif ch == '"':
+            in_q = True
+            current.append(ch)
+        elif ch in "([{":
+            depth += 1
+            current.append(ch)
+        elif ch in ")]}":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            token = "".join(current).strip()
+            if token:
+                tokens.append(token)
+            current = []
+        else:
+            current.append(ch)
+    token = "".join(current).strip()
+    if token:
+        tokens.append(token)
+    return tokens
+
+
+def _unwrap_struct_quotes(raw_value):
+    """移除结构体值最外层的一对引号，返回 (内容, 是否有引号)。"""
+    text = str(raw_value).strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        return text[1:-1], True
+    return text, False
+
+
+def normalize_named_single_struct(val, schema):
+    """
+    将指定字段的单元素数组包装还原为 UE 单结构体字符串，
+    并按字段配置恢复 STRING / VALUE / RAW。
+    """
+    if val is None or str(val).strip() == "":
+        return ""
+
+    text = str(val).strip()
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+        except Exception as e:
+            raise ValueError(f"单结构体数组JSON解析失败: {e}")
+        if not isinstance(parsed, list):
+            raise ValueError("单结构体包装必须是数组")
+        if len(parsed) != 1:
+            raise ValueError(f"单结构体数组只能包含1个元素，当前为{len(parsed)}个")
+        if not isinstance(parsed[0], str):
+            raise ValueError("单结构体数组中的元素必须是字符串")
+        text = parsed[0].strip()
+
+    if not (text.startswith("(") and text.endswith(")")):
+        raise ValueError("内容不是有效的UE单结构体")
+
+    parts = []
+    for token in _split_single_struct_assignments(text[1:-1]):
+        if "=" not in token:
+            raise ValueError(f"结构体子字段缺少等号: {token}")
+        subfield, _, raw_value = token.partition("=")
+        subfield = subfield.strip()
+        if not subfield:
+            raise ValueError("结构体存在空子字段名")
+
+        value, was_quoted = _unwrap_struct_quotes(raw_value)
+        mode = schema.get(subfield)
+        if mode == "STRING":
+            normalized = _quote_single_struct_string(value)
+        elif mode == "VALUE":
+            normalized = value
+        elif mode == "RAW":
+            normalized = value if was_quoted else str(raw_value).strip()
+        else:
+            normalized = str(raw_value).strip()
+        parts.append(f"{subfield}={normalized}")
+
+    if not parts:
+        raise ValueError("结构体没有可导入的子字段")
+    return f"({','.join(parts)})"
+
+
+def _coerce_scalar(v):
+    """把单元格值尽量还原为 JSON 兼容标量类型"""
+    if v is None:
+        return None
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return v
+    s = str(v).strip()
+    if s == "":
+        return None
+    low = s.lower()
+    if low == "true":
+        return True
+    if low == "false":
+        return False
+    if low in ("none", "null"):
+        return None
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except (ValueError, TypeError):
+        return s
+
+
+def restore_row_v2(data_row, plan):
+    """
+    把策划拆列格式还原为单列值：
+    - TMap → JSON 数组 [{"Key":k,"Value":v}, ...]
+    - TSet → JSON 数组 [v1, v2, ...]
+    - 普通结构体数组 → UE CSV 字符串 "(k=v,...),(k=v,...)" 包裹在 json.dumps 里
+    - 普通标量数组 → JSON 数组 [v1, v2, ...]
+    """
+    field_order = []
+    field_plan  = {}
+    seen_fields = set()
+
+    for item in plan:
+        fname = item[2]
+        ftype_key = item[0]
+        if ftype_key == 'normal':
+            if fname not in seen_fields:
+                field_order.append(('normal', fname))
+                seen_fields.add(fname)
+                field_plan[fname] = [item]
+            else:
+                field_plan[fname].append(item)
+        else:
+            if fname not in seen_fields:
+                # 记录字段归属种类（tmap/tset/struct/scalar）
+                if ftype_key in ('tmap_key', 'tmap_val'):
+                    kind = 'tmap'
+                elif ftype_key == 'tset_item':
+                    kind = 'tset'
+                elif ftype_key in ('struct_string', 'struct_value', 'struct_raw'):
+                    kind = 'single_struct'
+                elif ftype_key == 'array_struct':
+                    kind = 'struct'
+                else:
+                    kind = 'scalar'
+                field_order.append((kind, fname))
+                seen_fields.add(fname)
+                field_plan[fname] = []
+            field_plan[fname].append(item)
+
+    output_row = []
+
+    for ftype, fname in field_order:
+        items = field_plan[fname]
+
+        if ftype == 'normal':
+            ci  = items[0][1]
+            val = data_row[ci] if ci < len(data_row) else None
+            output_row.append(val)
+
+        elif ftype == 'single_struct':
+            parts = []
+            for item in items:
+                mode = item[0]
+                ci = item[1]
+                subfield = item[3]
+                val = data_row[ci] if ci < len(data_row) else None
+                if mode == 'struct_string':
+                    value_text = _quote_single_struct_string(val)
+                else:
+                    value_text = str(val) if val is not None else ""
+                parts.append(f"{subfield}={value_text}")
+            output_row.append(f"({','.join(parts)})")
+
+        elif ftype == 'tmap':
+            # 按 arr_idx 配对 key/val
+            key_map = {}   # arr_idx -> key值
+            val_map = {}   # arr_idx -> val值
+            for item in items:
+                ci  = item[1]
+                v   = data_row[ci] if ci < len(data_row) else None
+                idx = item[3]
+                if item[0] == 'tmap_key':
+                    key_map[idx] = _coerce_scalar(v)
+                elif item[0] == 'tmap_val':
+                    val_map[idx] = _coerce_scalar(v)
+            result = []
+            for idx in sorted(set(list(key_map.keys()) + list(val_map.keys()))):
+                k = key_map.get(idx)
+                v = val_map.get(idx)
+                # 跳过 key 和 value 均为空的条目
+                if k is None and v is None:
+                    continue
+                result.append({"Key": k, "Value": v})
+            # TMap → UE 要求 {k:v,...} Object 格式
+            if result:
+                tmap_obj = {str(e["Key"]): e["Value"] for e in result}
+                output_row.append(json.dumps(tmap_obj, ensure_ascii=False))
+            else:
+                output_row.append("{}")
+
+        elif ftype == 'tset':
+            # TSet：收集 item_N 值
+            idx_map = {}
+            for item in items:
+                ci  = item[1]
+                v   = data_row[ci] if ci < len(data_row) else None
+                idx = item[3]
+                if v is not None and str(v).strip() != "":
+                    idx_map[idx] = _coerce_scalar(v)
+            result = [idx_map[i] for i in sorted(idx_map.keys())]
+            output_row.append(json.dumps(result, ensure_ascii=False) if result else "[]")
+
+        elif ftype == 'struct':
+            # 普通结构体数组
+            subfield_order = {}
+            idx_map        = {}
+            for item in items:
+                ci       = item[1]
+                arr_idx  = item[3]
+                subfield = item[4]
+                val      = data_row[ci] if ci < len(data_row) else None
+                if arr_idx not in subfield_order:
+                    subfield_order[arr_idx] = []
+                if subfield not in subfield_order[arr_idx]:
+                    subfield_order[arr_idx].append(subfield)
+                if arr_idx not in idx_map:
+                    idx_map[arr_idx] = {}
+                idx_map[arr_idx][subfield] = str(val) if val is not None else ""
+            # 过滤全空条目
+            valid_idx = {i: e for i, e in idx_map.items()
+                         if any(v for v in e.values())}
+            if not valid_idx:
+                output_row.append("[]")
+                continue
+            result_list = []
+            for i in sorted(valid_idx.keys()):
+                entry = valid_idx[i]
+                parts = []
+                for k in subfield_order.get(i, list(entry.keys())):
+                    v_str = entry.get(k, "")
+                    if _needs_quotes(v_str):
+                        v_str = f'"{v_str}"'
+                    parts.append(f"{k}={v_str}")
+                result_list.append(f"({','.join(parts)})")
+            output_row.append(json.dumps(result_list, ensure_ascii=False))
+
+        else:  # scalar
+            idx_map = {}
+            for item in items:
+                ci  = item[1]
+                val = data_row[ci] if ci < len(data_row) else None
+                idx = item[3]
+                if val is not None and str(val).strip() != "":
+                    idx_map[idx] = val  # 先保留原始值，稍后判断
+
+            if not idx_map:
+                output_row.append("[]")
+                continue
+
+            # 检测是否全部是 (Key, Value) 旧版 TMap 格式
+            kv_parsed = {}
+            all_kv = True
+            for idx, raw in idx_map.items():
+                parsed_kv = _try_parse_kv_pair(raw)
+                if parsed_kv is None:
+                    all_kv = False
+                    break
+                kv_parsed[idx] = parsed_kv
+
+            if all_kv and kv_parsed:
+                # 旧版 TMap 格式 → 还原为 UE 要求的 {k:v,...} Object 格式
+                tmap_obj = {str(kv_parsed[i]["Key"]): kv_parsed[i]["Value"]
+                            for i in sorted(kv_parsed.keys())}
+                output_row.append(json.dumps(tmap_obj, ensure_ascii=False))
+            else:
+                # 普通标量数组
+                result = [_coerce_scalar(idx_map[i]) for i in sorted(idx_map.keys())]
+                output_row.append(json.dumps(result, ensure_ascii=False))
+
+    return output_row
+
+
+def _try_parse_kv_pair(v):
+    """
+    尝试把 (Key, Value) 格式的字符串解析为 {"Key":k,"Value":v}。
+    这是 UE 对 TMap 的旧版序列化格式（括号内逗号分隔，无等号）。
+    成功返回 dict，失败返回 None。
+    """
+    if v is None:
+        return None
+    s = str(v).strip()
+    if not (s.startswith("(") and s.endswith(")")):
+        return None
+    inner = s[1:-1]
+    if "=" in inner:
+        return None  # 有等号是普通 struct，不是此格式
+    comma_idx = inner.find(",")
+    if comma_idx == -1:
+        return None
+    k = inner[:comma_idx].strip().strip('"')
+    val_s = inner[comma_idx + 1:].strip().strip('"')
+    if not k:
+        return None
+    # 尝试把 Value 转数字
+    coerced_v = _coerce_scalar(val_s)
+    return {"Key": k, "Value": coerced_v}
+
+
+def is_split_table(r1, r2):
+    """
+    判断是否是拆列格式（第二行有子字段名）。
+    支持的子字段名格式：
+      普通结构体：  SubFieldName / SubFieldName_N
+      TMap：        key / key_N / val / val_N
+      TSet：        item / item_N
+      普通标量：    value / value_N
+    """
+    non_none   = [str(v).strip() for v in r2 if v is not None and str(v).strip()]
+    none_count = sum(1 for v in r2 if v is None)
+    if not non_none or none_count == 0:
+        return False
+    def is_subfield_name(s):
+        return bool(re.match(r'^[A-Za-z][A-Za-z0-9_]*(_\d+)?$', s))
+    return all(is_subfield_name(v) for v in non_none)
+
+
+def _find_oversized_cells(rows, headers):
+    """检查合表后将要写入 xlsx 的数据，返回超过 Excel 单元格上限的明细。"""
+    details = []
+    for row in rows:
+        row_name = row[0] if row and row[0] is not None else "<空行名>"
+        for ci, value in enumerate(row):
+            if value is None:
+                continue
+            char_count = len(str(value))
+            if char_count > EXCEL_CELL_CHAR_LIMIT:
+                field_name = headers[ci] if ci < len(headers) else f"第 {ci + 1} 列"
+                details.append({
+                    "row": str(row_name),
+                    "field": str(field_name),
+                    "chars": char_count,
+                })
+    return details
+
+
+def merge_xlsx(input_path, output_path):
+    wb_in    = openpyxl.load_workbook(input_path, read_only=True)
+    ws_in    = wb_in.active
+    all_rows = list(ws_in.iter_rows(values_only=True))
+    wb_in.close()
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    if not all_rows or len(all_rows) < 3:
+        raise ValueError("缺少完整的三行表头")
+
+    row1 = list(all_rows[0])
+    row2 = list(all_rows[1])
+    row3 = list(all_rows[2])
+
+    if str(row3[0]).strip() != "#FieldType":
+        raise ValueError("第三行缺少 #FieldType，数据必须从第四行开始")
+
+    if not is_split_table(row1, row2):
+        oversized = _find_oversized_cells(all_rows[3:], row1)
+        if oversized:
+            raise ExcelCellLimitError(oversized)
+        shutil.copy2(input_path, output_path)
+        return "无数组字段，原样复制"
+
+    asset_name = os.path.splitext(os.path.basename(input_path))[0]
+    plan = analyze_cehua_headers(row1, row2, row3, asset_name)
+    split_fields = get_split_fields(plan)
+
+    field_types = {}
+    for ci, item in enumerate(plan):
+        fname = item[2]
+        marker = row3[ci] if ci < len(row3) else None
+        marker = str(marker).strip().upper() if marker is not None else ""
+        if marker in ("ARRAY", "MAP"):
+            field_types[fname] = marker
+
+    if not split_fields:
+        oversized = _find_oversized_cells(all_rows[3:], row1)
+        if oversized:
+            raise ExcelCellLimitError(oversized)
+        shutil.copy2(input_path, output_path)
+        return "无数组字段，原样复制"
+
+    # 还原原始表头
+    original_headers = []
+    seen = set()
+    for item in plan:
+        fname = item[2]
+        if fname not in seen:
+            seen.add(fname)
+            original_headers.append(fname)
+
+    wb_out = openpyxl.Workbook()
+    ws_out = wb_out.active
+    ws_out.title = asset_name[:31]
+
+    header_fill = PatternFill("solid", fgColor="2F5496")
+    header_font = Font(color="FFFFFF", bold=True)
+    ws_out.append(original_headers)
+    for cell in ws_out[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+
+    # 合表后仍保留三行表头，导入数据固定从第四行开始。
+    ws_out.append([None] * len(original_headers))
+    merged_type_row = [field_types.get(name, None) for name in original_headers]
+    merged_type_row[0] = "#FieldType"
+    ws_out.append(merged_type_row)
+
+    restored_rows = [restore_row_v2(row, plan) for row in all_rows[3:]]
+    _validate_no_quoted_ue_text_expressions(restored_rows, original_headers)
+    oversized = _find_oversized_cells(restored_rows, original_headers)
+    if oversized:
+        raise ExcelCellLimitError(oversized)
+
+    for row in restored_rows:
+        ws_out.append(row)
+
+    for col in ws_out.columns:
+        max_len = max((len(str(c.value or "")) for c in col), default=0)
+        ws_out.column_dimensions[col[0].column_letter].width = min(max_len + 4, 40)
+
+    wb_out.save(output_path)
+    return f"合表完成，还原字段: {split_fields}"
+
+
+# ══════════════════════════════════════════════════════
+def validate_direct_import_xlsx(input_path):
+    """验证特例表的三行表头，不执行合表。"""
+    wb_in = openpyxl.load_workbook(input_path, read_only=True)
+    ws_in = wb_in.active
+    header_rows = list(ws_in.iter_rows(min_row=1, max_row=3, values_only=True))
+    wb_in.close()
+
+    if len(header_rows) < 3:
+        raise ValueError("缺少完整的三行表头")
+    if not header_rows[2] or str(header_rows[2][0]).strip() != "#FieldType":
+        raise ValueError("第三行缺少 #FieldType，数据必须从第四行开始")
+    if is_defense_reward_table(input_path):
+        _validate_defense_reward_headers(
+            list(header_rows[0]), list(header_rows[1]), list(header_rows[2])
+        )
+    return "三行表头验证通过，将直接从拆分表导入"
+
+
+def _parse_defense_reward_column(field_name, subfield_name, marker):
+    """
+    解析 DefenseRewardDefineT_S 专用拆分列。
+    返回 (kind, pool_idx, item_idx)，普通列返回 None。
+    """
+    marker = str(marker or "").strip().upper()
+    if marker != DEFENSE_REWARD_MARKER:
+        return None
+
+    parent_match = re.fullmatch(
+        rf"{re.escape(DEFENSE_REWARD_FIELD)}_(\d+)",
+        str(field_name or "").strip(),
+    )
+    if not parent_match:
+        raise ValueError(f"无法识别奖励池表头: {field_name}")
+    pool_idx = int(parent_match.group(1))
+    subfield = str(subfield_name or "").strip()
+
+    if subfield == "RandomDropBoxNum":
+        return "random_num", pool_idx, None
+
+    fixed_match = re.fullmatch(r"FixedBoxList_GiftBoxTid_(\d+)", subfield)
+    if fixed_match:
+        return "fixed_tid", pool_idx, int(fixed_match.group(1))
+
+    box_match = re.fullmatch(r"BoxList_(GiftBoxTid|Weight)_(\d+)", subfield)
+    if box_match:
+        kind = "box_tid" if box_match.group(1) == "GiftBoxTid" else "box_weight"
+        return kind, pool_idx, int(box_match.group(2))
+
+    raise ValueError(f"无法识别奖励子字段: {subfield}")
+
+
+def _validate_defense_reward_headers(row1, row2, row3):
+    """验证专用拆分表的列名和类型标记。"""
+    special_count = 0
+    random_pools = set()
+    for ci in range(max(len(row1), len(row2), len(row3))):
+        f1 = row1[ci] if ci < len(row1) else None
+        f2 = row2[ci] if ci < len(row2) else None
+        marker = row3[ci] if ci < len(row3) else None
+        parsed = _parse_defense_reward_column(f1, f2, marker)
+        if parsed is None:
+            continue
+        special_count += 1
+        if parsed[0] == "random_num":
+            random_pools.add(parsed[1])
+
+    if special_count == 0:
+        raise ValueError("未找到 DefenseRewardDefineT_S 专用拆分列")
+    if not random_pools:
+        raise ValueError("缺少 RandomDropBoxNum 拆分列")
+
+
+def _build_defense_reward_direct_rows(all_rows):
+    """
+    将专用拆分表直接还原为 UE 需要的嵌套 JSON 对象。
+    整个还原过程只存在于 Python 内存，不再生成嵌套文本单元格。
+    """
+    row1 = list(all_rows[0])
+    row2 = list(all_rows[1])
+    row3 = list(all_rows[2])
+    _validate_defense_reward_headers(row1, row2, row3)
+
+    column_plan = []
+    for ci in range(len(row1)):
+        parsed = _parse_defense_reward_column(
+            row1[ci],
+            row2[ci] if ci < len(row2) else None,
+            row3[ci] if ci < len(row3) else None,
+        )
+        if parsed is None:
+            field_name = str(row1[ci] or "").strip()
+            column_plan.append(("normal", ci, field_name, None, None))
+        else:
+            kind, pool_idx, item_idx = parsed
+            column_plan.append((kind, ci, DEFENSE_REWARD_FIELD, pool_idx, item_idx))
+
+    rows = []
+    max_cell_chars = 0
+    max_cell_row = ""
+
+    for data_row in all_rows[3:]:
+        row_name = data_row[0] if data_row else None
+        if row_name is None or str(row_name).strip() == "":
+            continue
+
+        row_data = {"Name": str(row_name)}
+        pools = {}
+
+        for kind, ci, field_name, pool_idx, item_idx in column_plan:
+            value = data_row[ci] if ci < len(data_row) else None
+            if kind == "normal":
+                if ci == 0 or not field_name:
+                    continue
+                row_data[field_name] = parse_cell_value(value)
+                continue
+
+            pool = pools.setdefault(pool_idx, {
+                "fixed": {},
+                "random": None,
+                "boxes": {},
+                "has_value": False,
+            })
+            has_value = value is not None and str(value).strip() != ""
+            if has_value:
+                pool["has_value"] = True
+
+            if kind == "random_num":
+                pool["random"] = _coerce_scalar(value)
+            elif kind == "fixed_tid" and has_value:
+                pool["fixed"][item_idx] = _coerce_scalar(value)
+            elif kind in ("box_tid", "box_weight"):
+                box = pool["boxes"].setdefault(item_idx, {})
+                if has_value:
+                    key = "GiftBoxTid" if kind == "box_tid" else "Weight"
+                    box[key] = _coerce_scalar(value)
+
+        score_pools = []
+        for pool_idx in sorted(pools):
+            pool = pools[pool_idx]
+            if not pool["has_value"]:
+                continue
+
+            fixed_list = [
+                {"GiftBoxTid": pool["fixed"][idx]}
+                for idx in sorted(pool["fixed"])
+            ]
+            box_list = []
+            for box_idx in sorted(pool["boxes"]):
+                box = pool["boxes"][box_idx]
+                if not box:
+                    continue
+                if "GiftBoxTid" not in box or "Weight" not in box:
+                    raise ValueError(
+                        f"行 '{row_name}' 奖励池 {pool_idx} 的 BoxList_{box_idx} "
+                        f"必须同时填写 GiftBoxTid 和 Weight"
+                    )
+                box_list.append({
+                    "GiftBoxTid": box["GiftBoxTid"],
+                    "Weight": box["Weight"],
+                })
+
+            score_pools.append({
+                "FixedBoxList": fixed_list,
+                "RandomDropBoxNum": pool["random"] if pool["random"] is not None else 0,
+                "BoxList": box_list,
+            })
+
+        row_data[DEFENSE_REWARD_FIELD] = score_pools
+        restored_text = json.dumps(score_pools, ensure_ascii=False)
+        if len(restored_text) > max_cell_chars:
+            max_cell_chars = len(restored_text)
+            max_cell_row = str(row_name)
+        rows.append(row_data)
+
+    if not rows:
+        raise ValueError("无数据行")
+
+    return rows, {
+        "max_cell_chars": max_cell_chars,
+        "max_cell_row": max_cell_row,
+        "max_cell_field": DEFENSE_REWARD_FIELD,
+    }
+
+
+def build_direct_import_rows(input_path):
+    """
+    直接从策划拆分表构建 UE JSON 数据行。
+    还原后的超长数组只存在于 Python 内存，不再写入 xlsx 单元格。
+    """
+    wb_in = openpyxl.load_workbook(input_path, read_only=True)
+    ws_in = wb_in.active
+    all_rows = list(ws_in.iter_rows(values_only=True))
+    wb_in.close()
+
+    if len(all_rows) < 3:
+        raise ValueError("缺少完整的三行表头")
+
+    row1 = list(all_rows[0])
+    row2 = list(all_rows[1])
+    row3 = list(all_rows[2])
+    if not row3 or str(row3[0]).strip() != "#FieldType":
+        raise ValueError("第三行缺少 #FieldType")
+
+    asset_name = os.path.splitext(os.path.basename(input_path))[0]
+    if asset_name == DEFENSE_REWARD_TABLE:
+        return _build_defense_reward_direct_rows(all_rows)
+
+    plan = analyze_cehua_headers(row1, row2, row3, asset_name)
+
+    original_headers = []
+    seen = set()
+    for item in plan:
+        fname = item[2]
+        if fname not in seen:
+            seen.add(fname)
+            original_headers.append(fname)
+
+    if not original_headers or len(original_headers) < 2:
+        raise ValueError("表头为空")
+
+    field_types = {}
+    for ci, item in enumerate(plan):
+        fname = item[2]
+        marker = row3[ci] if ci < len(row3) else None
+        marker = str(marker).strip().upper() if marker is not None else ""
+        if marker in ("ARRAY", "MAP"):
+            field_types[fname] = marker
+
+    array_fields = {name for name, marker in field_types.items() if marker == "ARRAY"}
+    map_fields = {name for name, marker in field_types.items() if marker == "MAP"}
+
+    rows = []
+    max_cell_chars = 0
+    max_cell_row = ""
+    max_cell_field = ""
+
+    for data_row in all_rows[3:]:
+        restored = restore_row_v2(data_row, plan)
+        if not restored:
+            continue
+        row_name = restored[0]
+        if row_name is None:
+            continue
+
+        row_data = {"Name": str(row_name)}
+        for value_idx, col_name in enumerate(original_headers[1:], start=1):
+            value = restored[value_idx] if value_idx < len(restored) else None
+            value_chars = len(str(value)) if value is not None else 0
+            if value_chars > max_cell_chars:
+                max_cell_chars = value_chars
+                max_cell_row = str(row_name)
+                max_cell_field = str(col_name)
+            row_data[col_name] = parse_cell_value(
+                value,
+                force_array=(col_name in array_fields),
+                force_map=(col_name in map_fields)
+            )
+        rows.append(row_data)
+
+    if not rows:
+        raise ValueError("无数据行")
+
+    return rows, {
+        "max_cell_chars": max_cell_chars,
+        "max_cell_row": max_cell_row,
+        "max_cell_field": max_cell_field,
+    }
+
+
+# 【第二部分】P4 冲突检测
+# ══════════════════════════════════════════════════════
+
+def check_p4_conflicts(table_list):
+    can_import = []
+    conflicts  = []
+    source_control = SOURCE_CONTROL_HELPERS
+
+    if source_control is None:
+        unreal.log_warning(
+            "当前 UE 未提供 SourceControlHelpers，已跳过 P4 冲突检测"
+        )
+        return list(table_list), conflicts
+
+    for entry in table_list:
+        ue_asset_path = f"{UE_BASE_PATH}/{entry}"
+        try:
+            state = source_control.query_file_state(ue_asset_path)
+            if state is None:
+                can_import.append(entry)
+                continue
+            if state.is_checked_out_other:
+                other_user = getattr(state, 'other_user_checked_out', '其他人')
+                conflicts.append((entry, str(other_user)))
+            else:
+                can_import.append(entry)
+        except Exception as e:
+            unreal.log_warning(f"P4状态查询失败 {entry}: {e}，默认允许导入")
+            can_import.append(entry)
+
+    return can_import, conflicts
+
+
+# ══════════════════════════════════════════════════════
+# 【第三部分】导入核心逻辑
+# ══════════════════════════════════════════════════════
+
+def _split_ue_array_items(inner):
+    """把 (k=v,...),(k=v,...) 拆成带括号的元素列表（引号内的括号/逗号不参与计数）"""
+    items, depth, current = [], 0, []
+    in_q = False
+    for ch in inner:
+        if ch == '"':
+            in_q = not in_q
+            current.append(ch)
+        elif ch == "(" and not in_q:
+            depth += 1
+            current.append(ch)
+        elif ch == ")" and not in_q:
+            depth -= 1
+            current.append(ch)
+            if depth == 0:
+                token = "".join(current).strip()
+                if token:
+                    items.append(token)
+                current = []
+        elif ch == "," and depth == 0 and not in_q:
+            pass  # 括号外的逗号是元素分隔符，跳过
+        else:
+            current.append(ch)
+    return items
+
+
+def _ue_struct_to_dict(s):
+    """把 (k=v,k=v) 解析成 dict，值尝试转数字"""
+    s = s.strip().strip("()")
+    if not s:
+        return None
+    pairs, current, in_q, depth = [], [], False, 0
+    for ch in s:
+        if ch == '"':
+            in_q = not in_q
+            current.append(ch)
+        elif ch == "(" and not in_q:
+            depth += 1
+            current.append(ch)
+        elif ch == ")" and not in_q:
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and not in_q and depth == 0:
+            pairs.append("".join(current).strip())
+            current = []
+        else:
+            current.append(ch)
+    if current:
+        pairs.append("".join(current).strip())
+    result = {}
+    for pair in pairs:
+        if "=" not in pair:
+            continue
+        k, _, v = pair.partition("=")
+        k = k.strip()
+        v = v.strip().strip('"')
+        try:
+            v = int(v)
+        except ValueError:
+            try:
+                v = float(v)
+            except ValueError:
+                pass
+        result[k] = v
+    return result if result else None
+
+
+def _is_tmap_list(obj):
+    """
+    判断一个 Python list 是否是 TMap 的 [{Key:..., Value:...}] 格式。
+    """
+    if not isinstance(obj, list) or not obj:
+        return False
+    return all(
+        isinstance(item, dict) and
+        len(item) == 2 and
+        any(k.lower() == "key"   for k in item) and
+        any(k.lower() == "value" for k in item)
+        for item in obj
+    )
+
+
+def _tmap_list_to_obj(lst):
+    """
+    把 [{Key:k, Value:v}, ...] 转成 UE fill_data_table 要求的 {k: v, ...} 对象。
+    """
+    result = {}
+    for item in lst:
+        key_name = next(k for k in item if k.lower() == "key")
+        val_name = next(k for k in item if k.lower() == "value")
+        result[str(item[key_name])] = item[val_name]
+    return result
+
+
+def _is_single_ue_struct(inner):
+    """
+    判断括号内是否是【单个 UE 结构体】的 key=value 序列，
+    例如 AttributeName="X",Attribute=...,AttributeOwner="..."
+    依据：按顶层逗号拆分后，存在形如  标识符=...  的 token。
+    （顶层 = 不在更深一层括号内；_split_scalar_items 已正确处理嵌套）
+    标量集合 (1,2,3) / ("a","b") 不含顶层 = → 返回 False。
+    """
+    for token in _split_scalar_items(inner):
+        if re.match(r'^[A-Za-z_]\w*\s*=', token.strip()):
+            return True
+    return False
+
+
+def parse_cell_value(val, force_array=False, force_map=False):
+    """
+    把 xlsx 单元格值转成适合 fill_data_table_from_json_string 的 Python 对象。
+    支持：
+    - TMap JSON [{Key:k,Value:v},...] → {k:v,...}  (UE 要求 Object 格式)
+    - JSON 格式 [...] / {...}         → 直接解析
+    - UE TMap CSV ((Key=k,Value=v),...)  → {k:v,...}
+    - UE TMap CSV ((Key,Value) 无等号)   → {k:v,...}
+    - UE TSet CSV (v1,v2,...)            → [v1,v2,...]
+    - UE 普通结构体数组 ((k=v,...),...)   → [{"k":v,...},...]
+    - 普通数字/字符串
+
+    force_array：由 import_table 的整列扫描决定。某列若任意一行出现过 [...] 或 ((
+    （数组特征），则该列判定为【数组字段】，force_array=True。
+    用于消解「单层括号 (键=值,...)」的二义性：
+      - 数组字段（如 SkillIds）：裸 (k=v,...) 是单元素，应包成数组 ["(k=v,...)"]；
+        空括号 () 应还原为空数组 []。否则触发 "Expected Array, got String"。
+      - 单结构体字段（如 GameplayAttribute）：force_array=False，裸 (k=v,...) 保持 String。
+    """
+    # 空单元格需要根据字段类型返回正确的空值。
+    # UE 的 TArray 字段要求 []；普通字段继续使用空字符串。
+    if val is None:
+        if force_map:
+            return {}
+        return [] if force_array else ""
+
+    s = str(val).strip()
+    if s == "":
+        if force_map:
+            return {}
+        return [] if force_array else ""
+
+    # JSON 格式
+    if (s.startswith("[") and s.endswith("]")) or \
+       (s.startswith("{") and s.endswith("}")):
+        try:
+            parsed = json.loads(s)
+            # [{Key:k,Value:v},...] → TMap → 转成 {k:v,...}
+            if _is_tmap_list(parsed):
+                return _tmap_list_to_obj(parsed)
+            return parsed
+        except Exception:
+            pass
+
+    # UE CSV 数组格式 ((...),...) 或 (v1,v2,...) 或空括号 ()
+    if s.startswith("(") and s.endswith(")"):
+        inner = s[1:-1].strip()
+
+        # 空括号 () → 空集合/空 map。
+        # 数组字段还原为空数组 []；其余保持空 dict（UE 对空 TMap 可接受 {}）。
+        if inner == "":
+            return [] if force_array else {}
+
+        # 单个结构体 (Key=Val,Key=Val,...)：括号内是顶层 key=value 序列，
+        # 既不是结构体数组 ((...),(...))，也不是标量集合 (v1,v2,...)。
+        #   - 单结构体字段（GameplayAttribute）：原样返回 String，交给 UE ImportText；
+        #     若误拆成数组，会触发 "Expected String, got Array"。
+        #   - 数组字段（SkillIds 等）单元素场景：force_array=True，包成 ["(k=v,...)"]
+        #     单元素数组（与合表输出格式一致），否则触发 "Expected Array, got String"。
+        if not inner.startswith("(") and _is_single_ue_struct(inner):
+            return [s] if force_array else s
+
+        if inner.startswith("("):
+            # 结构体数组：((Key=k,Value=v),...) 或 ((Key, Value) 无等号格式,...) 或 ((field=v,...)...)
+            raw_items = _split_ue_array_items(inner)
+            if raw_items:
+                result = []
+                is_tmap = None
+                for item in raw_items:
+                    # 先尝试 (Key, Value) 无等号格式
+                    kv = _try_parse_kv_pair(item)
+                    if kv is not None:
+                        if is_tmap is None:
+                            is_tmap = True
+                        result.append(kv)
+                        continue
+                    d = _ue_struct_to_dict(item)
+                    if d is None:
+                        result.append(item)
+                        is_tmap = False
+                        continue
+                    # 检测是否 TMap（Key + Value 两个字段）
+                    if is_tmap is None:
+                        lkeys = set(k.lower() for k in d.keys())
+                        is_tmap = (lkeys == {"key", "value"})
+                    if is_tmap:
+                        key_name = next((k for k in d if k.lower() == "key"),   None)
+                        val_name = next((k for k in d if k.lower() == "value"), None)
+                        result.append({
+                            "Key":   d.get(key_name),
+                            "Value": d.get(val_name),
+                        })
+                    else:
+                        result.append(d)
+                if result:
+                    # TMap → 转成 UE 要求的 {k:v,...} Object 格式
+                    if is_tmap:
+                        return _tmap_list_to_obj(result)
+                    return result
+
+        else:
+            # 纯标量列表：(v1,v2,...) → TSet
+            parts = _split_scalar_items(inner)
+            if parts:
+                result = []
+                for p in parts:
+                    p = p.strip().strip('"')
+                    try:
+                        result.append(int(p))
+                    except ValueError:
+                        try:
+                            result.append(float(p))
+                        except ValueError:
+                            result.append(p)
+                return result
+
+    # 数字
+    try:
+        if "." in s:
+            return float(s)
+        return int(s)
+    except Exception:
+        pass
+
+    return s
+
+
+def _split_scalar_items(inner):
+    """把 v1,v2,v3 拆成 ['v1','v2','v3']，正确处理带括号的嵌套"""
+    items, depth, current = [], 0, []
+    for ch in inner:
+        if ch == "(":
+            depth += 1
+            current.append(ch)
+        elif ch == ")":
+            depth -= 1
+            current.append(ch)
+        elif ch == "," and depth == 0:
+            token = "".join(current).strip()
+            if token:
+                items.append(token)
+            current = []
+        else:
+            current.append(ch)
+    token = "".join(current).strip()
+    if token:
+        items.append(token)
+    return items
+
+
+def import_table(entry):
+    """导入单张表，返回 (success, message)"""
+    xlsx_path     = os.path.join(EXPORT_BASE, entry + ".xlsx")
+    ue_asset_path = f"{UE_BASE_PATH}/{entry}"
+
+    if not os.path.exists(xlsx_path):
+        return False, "找不到xlsx文件"
+
+    try:
+        data_table = unreal.load_asset(ue_asset_path)
+        if data_table is None or not isinstance(data_table, unreal.DataTable):
+            return False, "找不到UE资产"
+
+        wb      = openpyxl.load_workbook(xlsx_path)
+        ws      = wb.active
+        headers = []
+
+        for col in range(2, ws.max_column + 1):
+            val = ws.cell(row=1, column=col).value
+            if val:
+                headers.append(str(val))
+
+        if not headers:
+            return False, "表头为空"
+
+        # 所有文件统一使用三行表头，数据固定从第四行开始。
+        if str(ws.cell(row=3, column=1).value).strip() != "#FieldType":
+            return False, "第三行缺少 #FieldType"
+        data_start = 4
+        array_fields = set()
+        map_fields = set()
+        table_name = os.path.basename(str(entry).replace("\\", "/"))
+
+        for col_idx, col_name in enumerate(headers, start=2):
+            marker = ws.cell(row=3, column=col_idx).value
+            marker = str(marker).strip().upper() if marker is not None else ""
+            if marker == "ARRAY":
+                array_fields.add(col_name)
+            elif marker == "MAP":
+                map_fields.add(col_name)
+
+        rows = []
+        for row in range(data_start, ws.max_row + 1):
+            row_name = ws.cell(row=row, column=1).value
+            if row_name is None:
+                continue
+            row_data = {"Name": str(row_name)}
+            for col_idx, col_name in enumerate(headers, start=2):
+                val = ws.cell(row=row, column=col_idx).value
+                _validate_no_quoted_ue_text_expressions(
+                    [[row_name, val]],
+                    ["---", col_name]
+                )
+                struct_schema = SINGLE_STRUCT_FIELD_SCHEMAS.get((table_name, col_name))
+                if struct_schema is not None:
+                    try:
+                        row_data[col_name] = normalize_named_single_struct(
+                            val, struct_schema
+                        )
+                    except ValueError as e:
+                        raise ValueError(
+                            f"行 '{row_name}' 字段 '{col_name}'：{e}"
+                        )
+                else:
+                    row_data[col_name] = parse_cell_value(
+                        val,
+                        force_array=(col_name in array_fields),
+                        force_map=(col_name in map_fields)
+                    )
+            rows.append(row_data)
+
+        if not rows:
+            return False, "无数据行"
+
+        json_str = json.dumps(rows, ensure_ascii=False)
+        result   = unreal.DataTableFunctionLibrary.fill_data_table_from_json_string(
+            data_table, json_str
+        )
+
+        if result:
+            if SOURCE_CONTROL_HELPERS is not None:
+                try:
+                    SOURCE_CONTROL_HELPERS.check_out_file(ue_asset_path)
+                except Exception:
+                    pass
+            save_ok = unreal.EditorAssetLibrary.save_asset(ue_asset_path)
+            if save_ok:
+                return True, f"{len(rows)} 行"
+            return False, "fill_data_table 成功，但资产保存失败"
+        else:
+            return False, "fill_data_table 失败"
+
+    except Exception as e:
+        return False, str(e)
+
+
+# ══════════════════════════════════════════════════════
+def import_direct_table(entry):
+    """特例表直接从 DataTables_Cehua 内存还原并导入 UE。"""
+    xlsx_path = os.path.join(CEHUA_BASE, entry + ".xlsx")
+    ue_asset_path = f"{UE_BASE_PATH}/{entry}"
+
+    if not os.path.exists(xlsx_path):
+        return False, "找不到策划xlsx文件"
+
+    try:
+        data_table = unreal.load_asset(ue_asset_path)
+        if data_table is None or not isinstance(data_table, unreal.DataTable):
+            return False, "找不到UE资产"
+
+        rows, direct_stats = build_direct_import_rows(xlsx_path)
+        json_str = json.dumps(rows, ensure_ascii=False)
+        result = unreal.DataTableFunctionLibrary.fill_data_table_from_json_string(
+            data_table, json_str
+        )
+
+        if result:
+            if SOURCE_CONTROL_HELPERS is not None:
+                try:
+                    SOURCE_CONTROL_HELPERS.check_out_file(ue_asset_path)
+                except Exception:
+                    pass
+            save_ok = unreal.EditorAssetLibrary.save_asset(ue_asset_path)
+            if save_ok:
+                max_chars = direct_stats["max_cell_chars"]
+                if max_chars > EXCEL_CELL_CHAR_LIMIT:
+                    limit_status = (
+                        f"已超过 {EXCEL_CELL_CHAR_LIMIT} 字符，"
+                        f"已通过内存模式成功导回"
+                    )
+                else:
+                    limit_status = (
+                        f"允许超限导回，本次未超过 "
+                        f"{EXCEL_CELL_CHAR_LIMIT} 字符"
+                    )
+                return True, (
+                    f"{limit_status}；直接内存导入 {len(rows)} 行，"
+                    f"JSON {len(json_str)} 字符，最长还原字段 {max_chars} 字符"
+                )
+            return False, "fill_data_table 成功，但资产保存失败"
+        return False, "fill_data_table 失败"
+
+    except Exception as e:
+        return False, str(e)
+
+
+def format_limit_skips(limit_skipped, max_items=10):
+    """格式化超过 Excel 单元格字符上限的跳过明细。"""
+    lines = []
+    total_cells = sum(len(details) for _, details in limit_skipped)
+    for entry, details in limit_skipped:
+        for detail in details:
+            if len(lines) >= max_items:
+                break
+            lines.append(
+                f"  • {entry} | 行 {detail['row']} | 字段 {detail['field']} | "
+                f"{detail['chars']} 字符"
+            )
+        if len(lines) >= max_items:
+            break
+    if total_cells > len(lines):
+        lines.append(f"  …其余 {total_cells - len(lines)} 个超限单元格请查看 Output Log")
+    return "\n".join(lines), total_cells
+
+
+def _xlsx_active_values(path):
+    """读取活动工作表的有效单元格值，用于排除 xlsx 压缩包时间戳和样式差异。"""
+    wb = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    try:
+        ws = wb.active
+        rows = []
+        for row in ws.iter_rows(values_only=True):
+            values = list(row)
+            while values and values[-1] is None:
+                values.pop()
+            rows.append(tuple(values))
+        while rows and not rows[-1]:
+            rows.pop()
+        return tuple(rows)
+    finally:
+        wb.close()
+
+
+def _xlsx_content_equal(before_path, after_path):
+    """按工作表内容判断两份 xlsx 是否相同。"""
+    return _xlsx_active_values(before_path) == _xlsx_active_values(after_path)
+
+
+def _compare_unquote(value):
+    """移除比较用结构体值最外层引号，保持导出拆表后的单元格表现。"""
+    text = str(value).strip()
+    if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+        return text[1:-1]
+    return text
+
+
+def _compare_struct_dict(value):
+    """将单个 UE 结构体解析为比较用字典，保留值的文本形式。"""
+    if value is None:
+        return {}
+    text = str(value).strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        return {}
+    result = {}
+    for token in _split_single_struct_assignments(text[1:-1]):
+        if "=" not in token:
+            continue
+        key, _, raw_value = token.partition("=")
+        key = key.strip()
+        if key:
+            result[key] = _compare_unquote(raw_value)
+    return result
+
+
+def _compare_kv_pair(value):
+    """解析 UE 旧式 TMap 元素 (Key,Value)，值保持文本形式。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not (text.startswith("(") and text.endswith(")")):
+        return None
+    inner = text[1:-1]
+    if "=" in inner:
+        return None
+    parts = _split_scalar_items(inner)
+    if len(parts) != 2:
+        return None
+    return {
+        "Key": _compare_unquote(parts[0]),
+        "Value": _compare_unquote(parts[1]),
+    }
+
+
+def _compare_array_items(value):
+    """
+    将 UE/JSON 数组解析为比较元素列表。
+    只用于生成临时拆分留档，不参与合表或 UE 导入。
+    """
+    if value is None:
+        return []
+    text = str(value).strip()
+    if not text:
+        return []
+
+    if text.startswith("[") and text.endswith("]"):
+        try:
+            parsed = json.loads(text)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+
+    if not (text.startswith("(") and text.endswith(")")):
+        return []
+
+    inner = text[1:-1].strip()
+    if not inner:
+        return []
+    if inner.startswith("("):
+        return _split_ue_array_items(inner)
+    if _is_single_ue_struct(inner):
+        return [text]
+    return [_compare_unquote(item) for item in _split_scalar_items(inner)]
+
+
+def _compare_defense_reward_pools(value):
+    """将留档中的 ScoreRewardPool 解析为二级字典列表。"""
+    result = []
+    for pool_item in _compare_array_items(value):
+        pool = pool_item if isinstance(pool_item, dict) else _compare_struct_dict(pool_item)
+        fixed_items = []
+        for item in _compare_array_items(pool.get("FixedBoxList")):
+            fixed_items.append(
+                item if isinstance(item, dict) else _compare_struct_dict(item)
+            )
+        box_items = []
+        for item in _compare_array_items(pool.get("BoxList")):
+            box_items.append(
+                item if isinstance(item, dict) else _compare_struct_dict(item)
+            )
+        result.append({
+            "FixedBoxList": fixed_items,
+            "RandomDropBoxNum": pool.get("RandomDropBoxNum"),
+            "BoxList": box_items,
+        })
+    return result
+
+
+def _write_defense_reward_archive_compare(
+    before_rows, row1, row2, row3, output_path, asset_name
+):
+    """按当前策划表列结构展开 DefenseRewardDefineT_S 修改前留档。"""
+    _validate_defense_reward_headers(row1, row2, row3)
+    archive_headers = list(before_rows[0])
+    archive_indices = {
+        str(field).strip(): ci
+        for ci, field in enumerate(archive_headers)
+        if field is not None and str(field).strip()
+    }
+    score_ci = archive_indices.get(DEFENSE_REWARD_FIELD)
+    if score_ci is None:
+        raise ValueError(f"导出留档缺少 {DEFENSE_REWARD_FIELD}")
+
+    archive_has_type_row = (
+        len(before_rows) >= 3
+        and before_rows[2]
+        and str(before_rows[2][0]).strip() == "#FieldType"
+    )
+    archive_data_rows = before_rows[3:] if archive_has_type_row else before_rows[1:]
+
+    output_wb = openpyxl.Workbook()
+    output_ws = output_wb.active
+    output_ws.title = asset_name[:31]
+    output_ws.append(row1)
+    output_ws.append(row2)
+    output_ws.append(row3)
+
+    for archive_row in archive_data_rows:
+        raw_score = archive_row[score_ci] if score_ci < len(archive_row) else None
+        pools = _compare_defense_reward_pools(raw_score)
+        expanded = []
+        for ci in range(len(row1)):
+            parsed = _parse_defense_reward_column(
+                row1[ci],
+                row2[ci] if ci < len(row2) else None,
+                row3[ci] if ci < len(row3) else None,
+            )
+            if parsed is None:
+                source_ci = archive_indices.get(str(row1[ci] or "").strip())
+                expanded.append(
+                    archive_row[source_ci]
+                    if source_ci is not None and source_ci < len(archive_row)
+                    else None
+                )
+                continue
+
+            kind, pool_idx, item_idx = parsed
+            pool = pools[pool_idx] if pool_idx < len(pools) else None
+            if pool is None:
+                expanded.append(None)
+            elif kind == "random_num":
+                expanded.append(pool.get("RandomDropBoxNum"))
+            elif kind == "fixed_tid":
+                items = pool.get("FixedBoxList") or []
+                item = items[item_idx] if item_idx < len(items) else {}
+                expanded.append(item.get("GiftBoxTid"))
+            else:
+                items = pool.get("BoxList") or []
+                item = items[item_idx] if item_idx < len(items) else {}
+                key = "GiftBoxTid" if kind == "box_tid" else "Weight"
+                expanded.append(item.get(key))
+        output_ws.append(expanded)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_wb.save(output_path)
+
+
+def _compare_array_item_value(items, plan_item):
+    """按策划表列计划，从数组元素中取出对应拆列值。"""
+    kind = plan_item[0]
+    arr_idx = plan_item[3]
+    if arr_idx >= len(items):
+        return None
+    item = items[arr_idx]
+
+    if kind in ("tset_item", "array_scalar"):
+        if isinstance(item, str):
+            text = item.strip()
+            if text.startswith("(") and text.endswith(")") and "=" not in text:
+                return _compare_unquote(text[1:-1])
+        return item
+
+    if isinstance(item, dict):
+        item_dict = item
+    else:
+        item_dict = _compare_kv_pair(item) or _compare_struct_dict(item)
+
+    if kind == "tmap_key":
+        key_name = next((key for key in item_dict if key.lower() == "key"), None)
+        return item_dict.get(key_name) if key_name else None
+    if kind == "tmap_val":
+        value_name = next((key for key in item_dict if key.lower() == "value"), None)
+        return item_dict.get(value_name) if value_name else None
+    if kind == "array_struct":
+        return item_dict.get(plan_item[4])
+    return None
+
+
+def _build_split_archive_for_compare(entry, archive_path, cehua_path, output_path):
+    """
+    根据当前策划表的三行表头，将 UE 原始留档临时展开成同结构拆分表。
+    DifficultyDefineT 的留档已在导出 v8 的 CSV 内存阶段直拆，直接复制。
+    """
+    if is_direct_import_table(entry) and not is_defense_reward_table(entry):
+        shutil.copy2(archive_path, output_path)
+        return
+
+    before_wb = openpyxl.load_workbook(archive_path, read_only=True, data_only=False)
+    after_wb = openpyxl.load_workbook(cehua_path, read_only=True, data_only=False)
+    try:
+        before_rows = list(before_wb.active.iter_rows(values_only=True))
+        after_header_rows = list(
+            after_wb.active.iter_rows(min_row=1, max_row=3, values_only=True)
+        )
+    finally:
+        before_wb.close()
+        after_wb.close()
+
+    if len(after_header_rows) < 3:
+        raise ValueError("当前策划表缺少完整的三行表头")
+    row1 = list(after_header_rows[0])
+    row2 = list(after_header_rows[1])
+    row3 = list(after_header_rows[2])
+    if not row3 or str(row3[0]).strip() != "#FieldType":
+        raise ValueError("当前策划表第三行缺少 #FieldType")
+    if not before_rows:
+        raise ValueError("导出留档为空")
+
+    asset_name = os.path.basename(str(entry).replace("\\", "/"))
+    if asset_name == DEFENSE_REWARD_TABLE:
+        _write_defense_reward_archive_compare(
+            before_rows, row1, row2, row3, output_path, asset_name
+        )
+        return
+
+    plan = analyze_cehua_headers(row1, row2, row3, asset_name)
+    archive_headers = list(before_rows[0])
+    archive_indices = {}
+    for ci, field in enumerate(archive_headers):
+        field_name = str(field).strip() if field is not None else ""
+        if field_name and field_name not in archive_indices:
+            archive_indices[field_name] = ci
+
+    archive_has_type_row = (
+        len(before_rows) >= 3
+        and before_rows[2]
+        and str(before_rows[2][0]).strip() == "#FieldType"
+    )
+    archive_data_rows = before_rows[3:] if archive_has_type_row else before_rows[1:]
+
+    output_wb = openpyxl.Workbook()
+    output_ws = output_wb.active
+    output_ws.title = asset_name[:31]
+    output_ws.append(row1)
+    output_ws.append(row2)
+    output_ws.append(row3)
+
+    for archive_row in archive_data_rows:
+        array_cache = {}
+        struct_cache = {}
+        expanded_row = []
+        for item in plan:
+            kind = item[0]
+            field = item[2]
+            source_ci = archive_indices.get(str(field).strip())
+            raw_value = (
+                archive_row[source_ci]
+                if source_ci is not None and source_ci < len(archive_row)
+                else None
+            )
+
+            if kind == "normal":
+                expanded_row.append(raw_value)
+            elif kind in ("struct_string", "struct_value", "struct_raw"):
+                if field not in struct_cache:
+                    struct_cache[field] = _compare_struct_dict(raw_value)
+                expanded_row.append(struct_cache[field].get(item[3]))
+            else:
+                if field not in array_cache:
+                    array_cache[field] = _compare_array_items(raw_value)
+                expanded_row.append(
+                    _compare_array_item_value(array_cache[field], item)
+                )
+        output_ws.append(expanded_row)
+
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    output_wb.save(output_path)
+
+
+def prepare_bcompare_session(entries):
+    """
+    将留档临时拆成策划格式，创建只包含本次实际变化表的比较目录。
+    返回 (changed_entries, warning_lines, before_dir, after_dir)。
+    """
+    before_dir = os.path.join(BCOMPARE_SESSION_BASE, "修改前").replace("\\", "/")
+    after_dir = os.path.join(BCOMPARE_SESSION_BASE, "修改后").replace("\\", "/")
+
+    if os.path.isdir(BCOMPARE_SESSION_BASE):
+        shutil.rmtree(BCOMPARE_SESSION_BASE)
+    os.makedirs(before_dir, exist_ok=True)
+    os.makedirs(after_dir, exist_ok=True)
+
+    changed_entries = []
+    warning_lines = []
+
+    for entry in entries:
+        archive_path = os.path.join(ARCHIVE_BASE, entry + ".xlsx").replace("\\", "/")
+        after_path = os.path.join(CEHUA_BASE, entry + ".xlsx").replace("\\", "/")
+        before_exists = os.path.isfile(archive_path)
+        after_exists = os.path.isfile(after_path)
+
+        if not after_exists:
+            warning_lines.append(f"{entry}：找不到当前策划拆分表")
+            continue
+
+        relative_path = entry + ".xlsx"
+        before_copy = os.path.join(before_dir, relative_path)
+        after_copy = os.path.join(after_dir, relative_path)
+        os.makedirs(os.path.dirname(before_copy), exist_ok=True)
+        os.makedirs(os.path.dirname(after_copy), exist_ok=True)
+        shutil.copy2(after_path, after_copy)
+
+        changed = True
+        if before_exists:
+            try:
+                _build_split_archive_for_compare(
+                    entry, archive_path, after_path, before_copy
+                )
+                changed = not _xlsx_content_equal(before_copy, after_copy)
+            except Exception as e:
+                warning_lines.append(f"{entry}：留档临时拆分失败，跳过该表比较（{e}）")
+                if os.path.isfile(before_copy):
+                    os.remove(before_copy)
+                if os.path.isfile(after_copy):
+                    os.remove(after_copy)
+                continue
+        else:
+            warning_lines.append(f"{entry}：留档中没有同名文件，按新增表处理")
+
+        if not changed:
+            if os.path.isfile(before_copy):
+                os.remove(before_copy)
+            if os.path.isfile(after_copy):
+                os.remove(after_copy)
+            continue
+
+        changed_entries.append(entry)
+
+    return changed_entries, warning_lines, before_dir, after_dir
+
+
+def _format_entry_list(entries, max_items=30):
+    lines = [f"  • {entry}" for entry in entries[:max_items]]
+    if len(entries) > max_items:
+        lines.append(f"  …其余 {len(entries) - max_items} 个表")
+    return "\n".join(lines)
+
+
+def confirm_continue_without_bcompare(reason):
+    """BCompare 未执行时，由用户决定继续导回或停止。"""
+    return show_yes_no(
+        "BCompare 未执行",
+        f"{reason}\n\n是否跳过本次比较，继续导回 UE？"
+    )
+
+
+def run_bcompare_before_import(entries):
+    """
+    仅比较本次可导入且实际变化的表。
+    返回 (是否继续导入, 状态文字)。
+    """
+    if not os.path.isdir(ARCHIVE_BASE):
+        return (
+            confirm_continue_without_bcompare(
+                f"找不到导出留档文件夹：\n{ARCHIVE_BASE}"
+            ),
+            "未执行（找不到留档文件夹）"
+        )
+
+    try:
+        changed, warnings, before_dir, after_dir = prepare_bcompare_session(entries)
+    except Exception as e:
+        unreal.log_error(f"BCompare 比较目录准备失败：{e}")
+        return (
+            confirm_continue_without_bcompare(f"比较目录准备失败：\n{e}"),
+            "未执行（比较目录准备失败）"
+        )
+
+    if warnings:
+        for warning in warnings:
+            unreal.log_warning(f"BCompare：{warning}")
+
+    if not changed:
+        warning_text = ""
+        if warnings:
+            warning_text = (
+                "\n\n比较准备提示：\n"
+                + "\n".join(f"  • {line}" for line in warnings[:10])
+            )
+        continue_import = show_yes_no(
+            "本次没有检测到修改",
+            f"本次准备导回 {len(entries)} 个表，和导出留档对比后未发现内容变化。\n\n"
+            f"{warning_text}\n\n"
+            f"是否仍然继续导回 UE？"
+        )
+        return (
+            continue_import,
+            f"已检查，实际变化 0 个表"
+        )
+
+    bcompare_path = get_saved_bcompare_path()
+    if not bcompare_path:
+        bcompare_path = choose_bcompare_exe()
+    if not bcompare_path:
+        return (
+            confirm_continue_without_bcompare("本次没有选择 BCompare.exe。"),
+            f"未执行（未选择程序；检测到 {len(changed)} 个变化表）"
+        )
+
+    try:
+        process = subprocess.Popen([
+            bcompare_path,
+            "/solo",
+            before_dir,
+            after_dir,
+        ])
+        process.wait()
+    except Exception as e:
+        unreal.log_error(f"启动 BCompare 失败：{e}")
+        return (
+            confirm_continue_without_bcompare(f"启动 BCompare 失败：\n{e}"),
+            f"启动失败（检测到 {len(changed)} 个变化表）"
+        )
+
+    warning_text = ""
+    if warnings:
+        warning_text = (
+            f"\n\n比较准备提示：\n"
+            + "\n".join(f"  • {line}" for line in warnings[:10])
+        )
+    continue_import = show_yes_no(
+        "确认导回 UE",
+        f"BCompare 已关闭。\n\n"
+        f"本次勾选并可导入：{len(entries)} 个表\n"
+        f"其中检测到变化：{len(changed)} 个表\n\n"
+        f"【即将导回的表格】\n{_format_entry_list(entries)}"
+        f"{warning_text}\n\n"
+        f"是否确认导回 UE？"
+    )
+    return (
+        continue_import,
+        f"已比较 {len(changed)} 个实际变化表"
+    )
+
+
+# 主流程
+# ══════════════════════════════════════════════════════
+
+unreal.log("=" * 50)
+unreal.log("开始执行：合表并导入")
+unreal.log("=" * 50)
+
+def run_preflight_check():
+    issues = []
+    if not os.path.exists(CEHUA_BASE):
+        issues.append(f"❌ 找不到策划文件夹：\n   {CEHUA_BASE}\n   请先运行「导出并拆表」脚本")
+    if not os.path.exists(EXPORT_BASE):
+        issues.append(f"❌ 找不到导出文件夹：\n   {EXPORT_BASE}\n   请先运行「导出并拆表」脚本")
+    if issues:
+        msg = "前置条件不满足，无法执行：\n\n" + "\n\n".join(issues)
+        unreal.log_error(msg)
+        unreal.EditorDialog.show_message("前置检查失败", msg, unreal.AppMsgType.OK)
+        return False
+    unreal.log("✅ 前置检查通过")
+    return True
+
+if not run_preflight_check():
+    unreal.log("脚本终止")
+else:
+    table_list, use_bcompare = load_table_list()
+    if not table_list:
+        unreal.log_warning("导入列表为空，退出")
+    else:
+        selected_total = len(table_list)
+        unreal.log(f"导入列表共 {selected_total} 个表")
+
+        merge_success, merge_fail   = [], []
+        limit_skipped               = []
+        direct_import_ready         = set()
+        direct_import_success       = []
+        direct_import_fail          = []
+        direct_import_reports       = []
+        import_success, import_fail = [], []
+        bcompare_status             = "本次未使用"
+
+        # ── 第一步：P4 冲突检测 ──
+        unreal.log("\n正在检测 P4 签出状态...")
+        can_prepare = []
+        conflicts = []
+        if SOURCE_CONTROL_HELPERS is None:
+            unreal.log_warning(
+                "当前 UE 未提供 SourceControlHelpers，已跳过 P4 冲突检测"
+            )
+            can_prepare = list(table_list)
+        else:
+            with unreal.ScopedSlowTask(selected_total, "检测 P4 冲突...") as task:
+                task.make_dialog(False)
+                for entry in table_list:
+                    task.enter_progress_frame(1, f"检测：{entry}")
+                    ue_asset_path = f"{UE_BASE_PATH}/{entry}"
+                    try:
+                        state = SOURCE_CONTROL_HELPERS.query_file_state(ue_asset_path)
+                        if state and state.is_checked_out_other:
+                            other = getattr(state, 'other_user_checked_out', '其他人')
+                            conflicts.append((entry, str(other)))
+                        else:
+                            can_prepare.append(entry)
+                    except Exception as e:
+                        unreal.log_warning(f"P4检测失败 {entry}: {e}，默认允许导入")
+                        can_prepare.append(entry)
+
+        # ── 第二步：冲突确认 ──
+        if conflicts:
+            conflict_lines = "\n".join(
+                [f"  • {entry}（签出人：{user}）" for entry, user in conflicts]
+            )
+            continue_after_conflicts = show_yes_no(
+                "P4 签出冲突",
+                f"以下 {len(conflicts)} 个表已被他人签出，无法导入：\n\n"
+                f"{conflict_lines}\n\n"
+                f"是否跳过冲突表，继续处理其余 {len(can_prepare)} 个表？"
+            )
+            if not continue_after_conflicts:
+                unreal.log("用户选择中止，导入取消")
+                can_prepare = []
+            else:
+                for entry, user in conflicts:
+                    import_fail.append(f"{entry}（已被 {user} 签出）")
+                unreal.log(
+                    f"跳过 {len(conflicts)} 个冲突表，继续处理 {len(can_prepare)} 个"
+                )
+
+        # ── 第三步：可选 BCompare 对比（合表之前） ──
+        if use_bcompare and can_prepare:
+            continue_import, bcompare_status = run_bcompare_before_import(can_prepare)
+            if not continue_import:
+                unreal.log("用户在 BCompare 确认阶段取消导回")
+                can_prepare = []
+        elif use_bcompare:
+            bcompare_status = "未执行（没有可导入的表）"
+
+        table_list = can_prepare
+        total = len(table_list)
+
+        # ── 第四步：合表 ──
+        with unreal.ScopedSlowTask(total, "正在合表...") as task:
+            task.make_dialog(True)
+            for entry in table_list:
+                task.enter_progress_frame(1, f"合表中 ({len(merge_success)}/{total})：{entry}")
+                if task.should_cancel():
+                    unreal.log_warning("用户取消了合表操作")
+                    break
+
+                input_path  = os.path.join(CEHUA_BASE,  entry + ".xlsx").replace("\\", "/")
+                output_path = os.path.join(EXPORT_BASE, entry + ".xlsx").replace("\\", "/")
+
+                if not os.path.exists(input_path):
+                    merge_fail.append(f"{entry}（找不到策划文件）")
+                    unreal.log_warning(f"找不到: {input_path}")
+                    continue
+
+                try:
+                    if is_direct_import_table(entry):
+                        msg = validate_direct_import_xlsx(input_path)
+                        direct_import_ready.add(entry)
+                    else:
+                        msg = merge_xlsx(input_path, output_path)
+                    merge_success.append(entry)
+                    if entry in direct_import_ready:
+                        unreal.log(f"✅ 直接导入准备: {entry} - {msg}")
+                    else:
+                        unreal.log(f"✅ 合表: {entry} - {msg}")
+                except ExcelCellLimitError as e:
+                    limit_skipped.append((entry, e.details))
+                    for detail in e.details:
+                        unreal.log_warning(
+                            f"⚠️ 超限跳过: {entry} | 行 {detail['row']} | "
+                            f"字段 {detail['field']} | {detail['chars']} 字符"
+                        )
+                except Exception as e:
+                    merge_fail.append(f"{entry}（{e}）")
+                    unreal.log_error(f"❌ 合表失败: {entry} → {e}")
+
+        unreal.log(
+            f"\n预处理完成：常规合表 {len(merge_success) - len(direct_import_ready)} 个，"
+            f"直接导入准备 {len(direct_import_ready)} 个，"
+            f"失败 {len(merge_fail)} 个，超限跳过 {len(limit_skipped)} 个"
+        )
+
+        if not merge_success:
+            no_success_msg = "没有可继续导入的表。\n请检查 DataTables_Cehua 文件夹。"
+            if limit_skipped:
+                limit_text, limit_cell_count = format_limit_skips(limit_skipped)
+                no_success_msg += (
+                    f"\n\n【超过 Excel {EXCEL_CELL_CHAR_LIMIT} 字符限制】"
+                    f"\n已跳过 {len(limit_skipped)} 个表，共 {limit_cell_count} 个超限单元格："
+                    f"\n{limit_text}"
+                )
+            unreal.EditorDialog.show_message(
+                "没有可导入表",
+                no_success_msg,
+                unreal.AppMsgType.OK
+            )
+        else:
+            # ── 第五步：导入 ──
+            can_import = list(merge_success)
+            if can_import:
+                with unreal.ScopedSlowTask(len(can_import), "正在导入到 UE...") as task:
+                    task.make_dialog(True)
+                    for entry in can_import:
+                        task.enter_progress_frame(
+                            1, f"导入中 ({len(import_success)}/{len(can_import)})：{entry}"
+                        )
+                        if task.should_cancel():
+                            unreal.log_warning("用户取消了导入操作")
+                            break
+
+                        if entry in direct_import_ready:
+                            ok, msg = import_direct_table(entry)
+                        else:
+                            ok, msg = import_table(entry)
+                        if ok:
+                            import_success.append(entry)
+                            if entry in direct_import_ready:
+                                direct_import_success.append(entry)
+                                direct_import_reports.append(f"  • {entry}：{msg}")
+                            unreal.log(f"✅ 导入: {entry} ({msg})")
+                        else:
+                            import_fail.append(f"{entry}（{msg}）")
+                            if entry in direct_import_ready:
+                                direct_import_fail.append(entry)
+                            unreal.log_error(f"❌ 导入失败: {entry} → {msg}")
+
+            # ── 最终弹窗 ──
+            direct_feature_status = "允许" if direct_import_ready else "本次未启用"
+            summary = (
+                f"合表并导入完成！\n\n"
+                f"【常规合表】成功 {len(merge_success) - len(direct_import_ready)} 个，"
+                f"失败 {len(merge_fail)} 个\n"
+                f"【直接内存导入】成功 {len(direct_import_success)} 个，"
+                f"失败 {len(direct_import_fail)} 个\n"
+                f"【超限导回功能】{direct_feature_status}\n"
+                f"【BCompare】{bcompare_status}\n"
+                f"【导入】成功 {len(import_success)} 个，失败 {len(import_fail)} 个\n"
+                f"【超限跳过】{len(limit_skipped)} 个表"
+            )
+            if import_success:
+                updated_table_lines = "\n".join(
+                    f"  • {entry}" for entry in import_success
+                )
+                summary += (
+                    f"\n\n【本次成功更新的表格（{len(import_success)} 个）】\n"
+                    f"{updated_table_lines}"
+                )
+            else:
+                summary += "\n\n【本次成功更新的表格】\n  无"
+            if direct_import_reports:
+                summary += "\n\n【超限导回详情】\n" + "\n".join(direct_import_reports)
+            all_fail = []
+            if merge_fail:
+                all_fail.append("合表失败：\n" + "\n".join(merge_fail[:5]))
+            if import_fail:
+                all_fail.append("导入失败/跳过：\n" + "\n".join(import_fail[:5]))
+            if limit_skipped:
+                limit_text, limit_cell_count = format_limit_skips(limit_skipped)
+                all_fail.append(
+                    f"超过 Excel {EXCEL_CELL_CHAR_LIMIT} 字符限制：\n"
+                    f"已跳过 {len(limit_skipped)} 个表，共 {limit_cell_count} 个超限单元格\n"
+                    f"{limit_text}"
+                )
+            if all_fail:
+                summary += "\n\n⚠️ 详情：\n" + "\n\n".join(all_fail)
+
+            unreal.log(summary)
+            unreal.EditorDialog.show_message("合表并导入完成", summary, unreal.AppMsgType.OK)
